@@ -347,3 +347,80 @@ async fn suspended_ingest_drops_without_queueing() {
     assert_eq!(handles.stats.accepted(), 1);
     assert_eq!(handles.stats.dropped_suspended(), 2);
 }
+
+// --- reflex-path join: pull context around an event, not the newest frames ---
+
+/// Fills a cache with frames one second apart on the sensor clock.
+fn cache_with_spaced_frames(count: u64) -> IngestRingBuffer<f32> {
+    let mut cache = IngestRingBuffer::<f32>::new(TEST_DIM);
+    for i in 0..count {
+        let block = vec![i as f32; FRAME_LEN];
+        cache
+            .push_snapshot(
+                &block,
+                CaptureTimestamp::from_nanos(i * 1_000_000_000),
+                TEST_DIM,
+            )
+            .expect("well-formed frame");
+    }
+    cache
+}
+
+#[test]
+fn export_around_brackets_an_event_time() {
+    let cache = cache_with_spaced_frames(10);
+    let mut out = Vec::with_capacity(cache.window_capacity());
+
+    // A detector reports an event at t=5s; pull 2s either side.
+    let written = cache.export_around(
+        &mut out,
+        CaptureTimestamp::from_nanos(5_000_000_000),
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+    );
+    assert_eq!(written, 5);
+    assert_eq!(out.len(), 5 * FRAME_LEN);
+    // Frames 3..=7, oldest first.
+    for (position, expected) in (3..=7).enumerate() {
+        let value = out[position * FRAME_LEN];
+        assert!((value - expected as f32).abs() < f32::EPSILON);
+    }
+}
+
+#[test]
+fn export_around_is_asymmetric_and_clamps_at_the_window_edge() {
+    let cache = cache_with_spaced_frames(10);
+    let mut out = Vec::with_capacity(cache.window_capacity());
+
+    // Lead-up only: what the wearer saw before the event.
+    let written = cache.export_around(
+        &mut out,
+        CaptureTimestamp::from_nanos(4_000_000_000),
+        Duration::from_secs(3),
+        Duration::ZERO,
+    );
+    assert_eq!(written, 4); // frames 1..=4
+    assert!((out[0] - 1.0).abs() < f32::EPSILON);
+
+    // An event older than anything retained yields nothing rather than the
+    // nearest frames, which would silently misattribute context.
+    let written = cache.export_around(
+        &mut out,
+        CaptureTimestamp::from_nanos(500_000_000_000),
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+    );
+    assert_eq!(written, 0);
+    assert!(out.is_empty());
+}
+
+#[test]
+fn export_matching_accepts_an_arbitrary_predicate() {
+    let cache = cache_with_spaced_frames(8);
+    let mut out = Vec::with_capacity(cache.window_capacity());
+
+    let written = cache.export_matching(&mut out, |meta| meta.sequence % 2 == 0);
+    assert_eq!(written, 4);
+    assert!((out[0] - 0.0).abs() < f32::EPSILON);
+    assert!((out[FRAME_LEN] - 2.0).abs() < f32::EPSILON);
+}

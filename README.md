@@ -98,6 +98,20 @@ needs eyes for some of its work and not the rest, which constrains three things:
   and `stride` thin the selection; `stride` is the cheap one, since consecutive
   frames at a few FPS are largely redundant.
 
+**A reflex path is a separate pipeline, and this crate is the join.** Reacting
+to something in the scene cannot run through here: at 3 FPS a frame arrives
+every 333 ms, already slower than human visual reaction, before inference adds
+anything. A reflex path wants a much higher frame rate, a payload of a few
+floats rather than a token block, and an interrupt rather than a context
+insertion -- so it belongs upstream, as close to the sensor as it can run.
+
+What this crate provides is the correlation. When a detector reports an event
+at some capture time, `export_around` pulls the frames bracketing that moment;
+by the time the agent is woken the newest frames are no longer the ones the
+event refers to. Selection is by `CaptureTimestamp`, so the detector and this
+cache must read the same sensor clock. `export_matching` takes an arbitrary
+predicate over `FrameMeta` for anything else.
+
 **Nothing here can be made to allocate by a hostile or broken sender.** The
 cache, the pool and the queue are all fixed size, and a full queue drops rather
 than growing. Wire framing and decode happen upstream of this crate and are

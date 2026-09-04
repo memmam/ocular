@@ -190,6 +190,61 @@ impl<T: TokenElement> IngestRingBuffer<T> {
         count
     }
 
+    /// Writes every frame `accept` returns `true` for, oldest first, into `out`.
+    ///
+    /// `out` is cleared and refilled; pre-size it with [`Self::window_capacity`]
+    /// and the call allocates nothing. Returns the number of frames written.
+    pub fn export_matching<F>(&self, out: &mut Vec<T>, mut accept: F) -> usize
+    where
+        F: FnMut(&FrameMeta) -> bool,
+    {
+        out.clear();
+        let mut count = 0;
+        for sequence in self.oldest_sequence()..self.head {
+            let slot = slot_of(sequence);
+            let Some(meta) = self.meta[slot] else {
+                continue;
+            };
+            if !accept(&meta) {
+                continue;
+            }
+            let start = slot * self.frame_len;
+            out.extend_from_slice(&self.tokens[start..start + self.frame_len]);
+            count += 1;
+        }
+        count
+    }
+
+    /// Writes the frames bracketing `centre` in sensor-clock time, oldest first.
+    ///
+    /// This is the join between a fast reflex path and the deliberative one.
+    /// A frame-rate detector running upstream reports an event at some capture
+    /// time; the agent then pulls the visual context around that moment out of
+    /// here rather than the newest frames, which by the time it is woken are
+    /// not the ones the event refers to.
+    ///
+    /// Selection is by [`CaptureTimestamp`], the sensor device's clock, so the
+    /// detector and this cache must be reading the same clock. Arrival time on
+    /// this node is not comparable and is not used.
+    ///
+    /// Returns the number of frames written, which is zero if the event
+    /// predates the retained window.
+    pub fn export_around(
+        &self,
+        out: &mut Vec<T>,
+        centre: CaptureTimestamp,
+        before: Duration,
+        after: Duration,
+    ) -> usize {
+        let span_before = u64::try_from(before.as_nanos()).unwrap_or(u64::MAX);
+        let span_after = u64::try_from(after.as_nanos()).unwrap_or(u64::MAX);
+        let low = centre.nanos.saturating_sub(span_before);
+        let high = centre.nanos.saturating_add(span_after);
+        self.export_matching(out, |meta| {
+            meta.capture.nanos >= low && meta.capture.nanos <= high
+        })
+    }
+
     /// Discards every retained frame without freeing the backing store.
     ///
     /// Call this when a visual task ends, so context from one situation cannot
