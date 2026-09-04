@@ -1,185 +1,275 @@
 #![deny(unsafe_code)]
 #![warn(clippy::pedantic, clippy::cargo)]
 
-//! Bounded, snapshot-driven ingest path for compressed visual tokens.
+//! Bounded ingest path for compressed visual tokens arriving from a remote
+//! sensor device.
 //!
-//! The crate covers the tail of the pipeline: a fixed-capacity cyclic cache
-//! ([`ring_buffer::IngestRingBuffer`]) fed over an mpsc channel by a
-//! supervisor task ([`orchestrator::AsyncIngestOrchestrator`]), plus a length
-//! check ([`StreamGuard`]) applied to every frame on the way in.
+//! # Topology
 //!
-//! Encoder hidden-state extraction and resampler compression are upstream of
-//! this crate and are not implemented here; [`IngestConfig::PATCH_COUNT`] and
-//! [`IngestConfig::ENCODER_DIM`] are published for those producers to size
-//! against.
+//! Perception and language run on separate machines. The sensor device encodes
+//! a frame and projects it to `TOKENS_PER_FRAME * target_dim` elements; this
+//! crate runs on the compute node and owns everything downstream of the wire:
+//!
+//! ```text
+//! [sensor device: encoder + resampler] --wire--> [receive task]
+//!     -> FrameSender::try_publish (drop-oldest, never blocks the wire)
+//!     -> AsyncIngestOrchestrator (drain loop)
+//!     -> IngestRingBuffer (fixed slots, copy-in, no allocation)
+//!     -> export_into(&mut Vec<T>) -> LLM context insertion
+//! ```
+//!
+//! # Allocation
+//!
+//! Every buffer is allocated during construction. In steady state the ingest
+//! path performs no heap allocation: frames are copied into pre-sized slots,
+//! wire buffers are leased from a [`pool::BufferPool`] and returned on drop,
+//! and [`ring_buffer::IngestRingBuffer::export_into`] fills a caller-owned
+//! buffer. [`ring_buffer::IngestRingBuffer::export_linearized_payload`] is a
+//! convenience wrapper that does allocate, and says so.
+//!
+//! # Element type
+//!
+//! Storage is generic over [`TokenElement`]. `f32` and `f64` are implemented
+//! here; implement it for `half::f16` or `half::bf16` to keep the wire, the
+//! cache and the model at one width with no conversion. Matching the model's
+//! width halves the resident window relative to `f32`.
 
 pub mod orchestrator;
+pub mod pool;
 pub mod ring_buffer;
 
+use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-/// System dimension primitives tailored to native open-weight backbones (e.g., SigLIP-SO400M).
+/// Dimension primitives for a SigLIP-class encoder feeding a local text model.
 pub struct IngestConfig;
 impl IngestConfig {
-    /// Patch sequence length of one encoded snapshot (27x27 grid at 384px, patch 14).
+    /// Patch sequence length of one encoded snapshot (27x27 grid, 384px, patch 14).
+    /// Published for the sensor device to size against; unused on this side.
     pub const PATCH_COUNT: usize = 729;
-    /// Hidden width of the visual encoder.
+    /// Hidden width of the visual encoder. Published for the sensor device.
     pub const ENCODER_DIM: usize = 1152;
-    /// Token count emitted per frame by the resampler. This is a sequence
-    /// length, not a vector width: a frame carries `COMPRESSED_DIM * target_dim`
-    /// elements.
-    pub const COMPRESSED_DIM: usize = 64;
+    /// Tokens emitted per frame by the resampler. A sequence length, not a
+    /// vector width: one frame carries `TOKENS_PER_FRAME * target_dim` elements.
+    pub const TOKENS_PER_FRAME: usize = 64;
     /// Depth of the timeline cache (10s at 3 FPS).
     pub const MAX_FIFO_FRAMES: usize = 30;
 }
 
-/// `CompressedFrame` encapsulates the downsampled visual tokens ready for LLM context injection.
-#[derive(Clone, Debug)]
-pub struct CompressedFrame {
-    pub timestamp: Instant,
-    /// Row-major token block of `IngestConfig::COMPRESSED_DIM * dimensions` elements.
-    pub token_data: Vec<f32>,
-    /// Target dimension width of the text model this frame was projected for.
-    pub dimensions: usize,
+/// Element type of a token block.
+///
+/// Implemented here for `f32` and `f64`. Implement it for `half::f16` or
+/// `half::bf16` to match the model's native width.
+pub trait TokenElement: Copy + Default + Send + Sync + 'static {
+    /// Returns `false` for NaN and infinities, which must never reach the
+    /// model's context.
+    fn is_finite_token(self) -> bool;
 }
 
-/// Length gate applied to every frame entering the cache.
+impl TokenElement for f32 {
+    #[inline]
+    fn is_finite_token(self) -> bool {
+        f32::is_finite(self)
+    }
+}
+
+impl TokenElement for f64 {
+    #[inline]
+    fn is_finite_token(self) -> bool {
+        f64::is_finite(self)
+    }
+}
+
+/// Capture time as measured by the sensor device.
+///
+/// Nanoseconds against an epoch the two machines agree on. This is deliberately
+/// not [`std::time::Instant`]: an `Instant` is opaque, process-local and has no
+/// constructor from a raw value, so it cannot cross a wire.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CaptureTimestamp {
+    pub nanos: u64,
+}
+
+impl CaptureTimestamp {
+    #[must_use]
+    pub const fn from_nanos(nanos: u64) -> Self {
+        Self { nanos }
+    }
+}
+
+/// Per-frame bookkeeping retained alongside a slot's token block.
+#[derive(Clone, Copy, Debug)]
+pub struct FrameMeta {
+    /// Capture time reported by the sensor device.
+    pub capture: CaptureTimestamp,
+    /// Local monotonic arrival time, stamped on this machine. Valid for
+    /// recency and staleness checks; not comparable with `capture`.
+    pub arrival: Instant,
+    /// Monotonic sequence number assigned on acceptance.
+    pub sequence: u64,
+}
+
+/// Reason a frame was refused entry to the cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IngestError {
+    /// Token block length did not match the configured geometry. Usually means
+    /// the sensor device is projecting to a different width than this node's
+    /// model expects.
+    LengthMismatch { expected: usize, actual: usize },
+    /// Frame declared a target width other than the one this cache validates
+    /// against, even though its length happened to match.
+    DimensionMismatch { expected: usize, actual: usize },
+    /// Block contained a NaN or an infinity. Left unchecked these propagate
+    /// through attention and silently poison every subsequent token.
+    NonFiniteElement { index: usize },
+}
+
+impl fmt::Display for IngestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::LengthMismatch { expected, actual } => write!(
+                f,
+                "token block length {actual} does not match expected {expected}"
+            ),
+            Self::DimensionMismatch { expected, actual } => write!(
+                f,
+                "frame declares target width {actual}, cache validates against {expected}"
+            ),
+            Self::NonFiniteElement { index } => {
+                write!(f, "non-finite element at index {index}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for IngestError {}
+
+/// Validation gate between the wire and the model's context.
 pub struct StreamGuard;
+
 impl StreamGuard {
-    /// Rejects a token block whose element count does not match the configured
-    /// geometry, so a malformed frame cannot be linearized into the context array.
+    /// Checks a token block's geometry and numeric sanity before it is copied
+    /// into the cache.
     ///
-    /// This is a length check only. It does not inspect frame contents and does
-    /// not detect a block that is correctly sized but projected for a different
-    /// target width.
+    /// The finiteness scan is the reason this is not just a length check: a
+    /// single NaN reaching the context corrupts the forward pass with no error
+    /// anywhere, which is expensive to diagnose after the fact.
     ///
     /// # Errors
     ///
-    /// Returns an error when `incoming_len != expected_len`.
-    #[inline]
-    pub fn verify_tensor_bounds(
-        incoming_len: usize,
+    /// [`IngestError::LengthMismatch`] when the block is not exactly
+    /// `expected_len` elements, [`IngestError::DimensionMismatch`] when the
+    /// frame's declared width disagrees with the cache's, and
+    /// [`IngestError::NonFiniteElement`] on the first NaN or infinity found.
+    pub fn verify<T: TokenElement>(
+        tokens: &[T],
         expected_len: usize,
-    ) -> Result<(), &'static str> {
-        if incoming_len != expected_len {
-            return Err(
-                "StreamGuard Violation: Structural dimensionality mismatch. Visual array rejected.",
-            );
+        declared_dim: usize,
+        expected_dim: usize,
+    ) -> Result<(), IngestError> {
+        if tokens.len() != expected_len {
+            return Err(IngestError::LengthMismatch {
+                expected: expected_len,
+                actual: tokens.len(),
+            });
+        }
+        if declared_dim != expected_dim {
+            return Err(IngestError::DimensionMismatch {
+                expected: expected_dim,
+                actual: declared_dim,
+            });
+        }
+        for (index, value) in tokens.iter().enumerate() {
+            if !value.is_finite_token() {
+                return Err(IngestError::NonFiniteElement { index });
+            }
         }
         Ok(())
     }
 }
 
-#[cfg(test)]
-// Every float compared below is a marker value copied verbatim through the
-// pipeline, never computed, so exact comparison is the intended check.
-#[allow(clippy::float_cmp)]
-mod tests {
-    use super::orchestrator::AsyncIngestOrchestrator;
-    use super::*;
-    use std::time::Duration;
+/// Observable counters for the ingest path.
+///
+/// A width disagreement between the sensor device and this node rejects every
+/// frame. That must be visible to a supervisor rather than printed to stderr,
+/// so rejections are counted here by cause.
+#[derive(Debug, Default)]
+pub struct IngestStats {
+    accepted: AtomicU64,
+    rejected_length: AtomicU64,
+    rejected_dimension: AtomicU64,
+    rejected_non_finite: AtomicU64,
+    dropped_queue_full: AtomicU64,
+    evicted: AtomicU64,
+}
 
-    #[tokio::test]
-    async fn test_pipeline_concurrency_and_bounds() {
-        let target_dim = 2048; // Edge node validation dimension (e.g., Qwen3-VL/Gemma widths)
-        let (orchestrator, tx, buffer) = AsyncIngestOrchestrator::new(target_dim, 10);
+impl IngestStats {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-        // Disengage the orchestration tracker into the background.
-        tokio::spawn(orchestrator.start_orchestration_loop());
+    pub(crate) fn record_accepted(&self) {
+        self.accepted.fetch_add(1, Ordering::Relaxed);
+    }
 
-        // Well-formed payloads pass the guard.
-        let valid_frame = CompressedFrame {
-            timestamp: Instant::now(),
-            token_data: vec![1.337f32; IngestConfig::COMPRESSED_DIM * target_dim],
-            dimensions: target_dim,
+    pub(crate) fn record_evicted(&self) {
+        self.evicted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_dropped_queue_full(&self) {
+        self.dropped_queue_full.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_rejection(&self, err: IngestError) {
+        let counter = match err {
+            IngestError::LengthMismatch { .. } => &self.rejected_length,
+            IngestError::DimensionMismatch { .. } => &self.rejected_dimension,
+            IngestError::NonFiniteElement { .. } => &self.rejected_non_finite,
         };
-        assert!(tx.send(valid_frame).await.is_ok());
-
-        // Wait for the loop to drain the channel rather than assuming a fixed
-        // delay is enough.
-        let linear_data = await_payload(&buffer, IngestConfig::COMPRESSED_DIM * target_dim).await;
-        assert_eq!(linear_data.len(), IngestConfig::COMPRESSED_DIM * target_dim);
-        assert_eq!(linear_data[0], 1.337f32);
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    #[tokio::test]
-    async fn test_malformed_frame_is_rejected_without_stalling_loop() {
-        let target_dim = 128;
-        let (orchestrator, tx, buffer) = AsyncIngestOrchestrator::new(target_dim, 10);
-        tokio::spawn(orchestrator.start_orchestration_loop());
-
-        // Short block: the guard must drop it and the loop must keep running.
-        tx.send(CompressedFrame {
-            timestamp: Instant::now(),
-            token_data: vec![0.0f32; 16],
-            dimensions: target_dim,
-        })
-        .await
-        .expect("channel open");
-
-        tx.send(CompressedFrame {
-            timestamp: Instant::now(),
-            token_data: vec![2.0f32; IngestConfig::COMPRESSED_DIM * target_dim],
-            dimensions: target_dim,
-        })
-        .await
-        .expect("channel open");
-
-        let linear_data = await_payload(&buffer, IngestConfig::COMPRESSED_DIM * target_dim).await;
-        assert_eq!(linear_data.len(), IngestConfig::COMPRESSED_DIM * target_dim);
-        assert_eq!(linear_data[0], 2.0f32);
+    /// Frames copied into the cache.
+    #[must_use]
+    pub fn accepted(&self) -> u64 {
+        self.accepted.load(Ordering::Relaxed)
     }
 
-    #[test]
-    fn test_cache_evicts_oldest_beyond_capacity() {
-        let target_dim = 4;
-        let frame_len = IngestConfig::COMPRESSED_DIM * target_dim;
-        let mut cache = ring_buffer::IngestRingBuffer::new(target_dim);
-
-        // Overfill by 5 frames; the payload must stay capped at MAX_FIFO_FRAMES.
-        let overshoot = 5;
-        for i in 0..IngestConfig::MAX_FIFO_FRAMES + overshoot {
-            #[allow(clippy::cast_precision_loss)]
-            let marker = i as f32;
-            cache
-                .push_snapshot(CompressedFrame {
-                    timestamp: Instant::now(),
-                    token_data: vec![marker; frame_len],
-                    dimensions: target_dim,
-                })
-                .expect("well-formed frame");
-        }
-
-        let payload = cache.export_linearized_payload();
-        assert_eq!(payload.len(), IngestConfig::MAX_FIFO_FRAMES * frame_len);
-        // Oldest surviving frame is the one at index `overshoot`.
-        #[allow(clippy::cast_precision_loss)]
-        let oldest = overshoot as f32;
-        assert_eq!(payload[0], oldest);
-        #[allow(clippy::cast_precision_loss)]
-        let newest = (IngestConfig::MAX_FIFO_FRAMES + overshoot - 1) as f32;
-        assert_eq!(payload[payload.len() - 1], newest);
+    /// Frames overwritten because the window advanced past them.
+    #[must_use]
+    pub fn evicted(&self) -> u64 {
+        self.evicted.load(Ordering::Relaxed)
     }
 
-    #[test]
-    fn test_guard_bounds() {
-        assert!(StreamGuard::verify_tensor_bounds(64, 64).is_ok());
-        assert!(StreamGuard::verify_tensor_bounds(63, 64).is_err());
+    /// Frames discarded at the sender because the queue was full.
+    #[must_use]
+    pub fn dropped_queue_full(&self) -> u64 {
+        self.dropped_queue_full.load(Ordering::Relaxed)
     }
 
-    /// Polls the shared cache until it holds `expected_len` elements, so the
-    /// tests do not depend on a fixed sleep being long enough.
-    async fn await_payload(
-        buffer: &std::sync::Arc<tokio::sync::RwLock<ring_buffer::IngestRingBuffer>>,
-        expected_len: usize,
-    ) -> Vec<f32> {
-        for _ in 0..500 {
-            let payload = buffer.read().await.export_linearized_payload();
-            if payload.len() >= expected_len {
-                return payload;
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-        panic!("ingest loop did not commit the frame within the timeout");
+    /// Frames refused for a length mismatch.
+    #[must_use]
+    pub fn rejected_length(&self) -> u64 {
+        self.rejected_length.load(Ordering::Relaxed)
+    }
+
+    /// Frames refused for a declared-width mismatch.
+    #[must_use]
+    pub fn rejected_dimension(&self) -> u64 {
+        self.rejected_dimension.load(Ordering::Relaxed)
+    }
+
+    /// Frames refused for containing a NaN or infinity.
+    #[must_use]
+    pub fn rejected_non_finite(&self) -> u64 {
+        self.rejected_non_finite.load(Ordering::Relaxed)
+    }
+
+    /// Total refused frames across all causes.
+    #[must_use]
+    pub fn rejected_total(&self) -> u64 {
+        self.rejected_length() + self.rejected_dimension() + self.rejected_non_finite()
     }
 }

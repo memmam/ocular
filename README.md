@@ -2,11 +2,9 @@
 
 Rust workspace for the `vision-ingest` pipeline.
 
-## Crates
-
 | Crate | Purpose |
 | --- | --- |
-| [`vision-ingest`](vision-ingest/) | Bounded, snapshot-driven ingest buffer for compressed visual tokens feeding a local LLM context. |
+| [`vision-ingest`](vision-ingest/) | Bounded ingest path for compressed visual tokens arriving from a remote sensor device. |
 
 ## Build
 
@@ -15,26 +13,73 @@ cargo test
 cargo clippy --all-targets
 ```
 
-## Scope
+## Topology
 
-`vision-ingest` implements the tail of the ingest path described in the design
-spec: a fixed-capacity cyclic frame cache behind a bounded mpsc channel, with a
-length gate on every frame entering the cache.
+Perception and language run on separate machines. The sensor device encodes a
+frame and projects it to the target model's width; the compute node runs the
+LLM and everything in this crate.
 
-Encoder hidden-state extraction (SigLIP-class, 729 patches x 1152) and the
-resampler / projection stage that compresses a frame to 64 tokens are **not**
-implemented here. `IngestConfig::PATCH_COUNT` and `IngestConfig::ENCODER_DIM`
-are published so upstream producers can size against them.
+```
+[sensor device]                          [compute node]
+ camera -> SigLIP encoder -> resampler
+        64 x target_dim tokens
+                 |
+                 +---- wire ----> receive task
+                                    | FrameSender::try_publish   (drop-oldest)
+                                    v
+                                  AsyncIngestOrchestrator        (drain loop)
+                                    | StreamGuard                (geometry + finiteness)
+                                    v
+                                  IngestRingBuffer               (30 fixed slots)
+                                    | export_into(&mut Vec<T>)
+                                    v
+                                  LLM context insertion
+```
 
-### Known deviations from the design spec
+The encoder and resampler are out of scope for this crate — it never sees a
+pixel. `IngestConfig::PATCH_COUNT` (729) and `IngestConfig::ENCODER_DIM` (1152)
+are published so the sensor side can size against them.
 
-- **The path is memory-bounded, not allocation-free.** Frame payloads are owned
-  `Vec<f32>` buffers handed over by the producer, and
-  `export_linearized_payload` allocates a fresh output buffer sized to the
-  retained window on every call (~15.7 MB at a 2048-wide target). A genuinely
-  zero-allocation hot path requires slot reuse and a caller-supplied output
-  buffer, which is a different API.
-- **The orchestration loop does not catch panics.** A panic terminates the task
-  and surfaces through the caller's `JoinHandle`. There is no restart.
-- **`StreamGuard` validates element count only.** A correctly sized block that
-  was projected for a different target width is not detected.
+## Design notes
+
+**`target_dim` is a cross-device contract.** The sensor device's projection
+must match the width of the model on the compute node. A mismatch rejects every
+frame, so `StreamGuard` checks the declared width as well as the block length,
+and `IngestStats::rejected_dimension` makes the failure visible to a supervisor
+instead of printing to stderr. Negotiate the width at session start.
+
+**Backpressure never reaches the sensor.** The cache holds a fixed recent
+window by design, so a compute node that falls behind should discard frames,
+not stall capture. `FrameSender::try_publish` drops when the queue is full and
+counts the drop; it never blocks and never awaits.
+
+**Timestamps cross a machine boundary.** `CaptureTimestamp` is nanoseconds
+against an epoch both machines agree on. `std::time::Instant` is deliberately
+not used for capture time: it is opaque, process-local, and has no constructor
+from a raw value, so it cannot be sent over a wire. Arrival is stamped locally
+as an `Instant` and is valid only for recency checks on this node.
+
+**Finiteness is checked, not assumed.** A NaN or infinity reaching the model's
+context corrupts the forward pass with no error raised anywhere. The guard
+scans for it and rejects the frame.
+
+**No allocation after construction.** Cache slots are one flat pre-sized block
+and frames are copied into them. Wire buffers are leased from `BufferPool` and
+returned when the lease drops. `export_into` fills a caller-owned buffer; size
+it with `window_capacity()` and reuse it. `export_linearized_payload` allocates
+per call and exists only for convenience — the docs say so.
+
+The measured cost this avoids is allocator churn and first-touch page faults on
+a ~15.7 MB window (2048-wide, `f32`) every export, which shows up as latency
+jitter next to an LLM competing for the same unified memory. It is not a
+bandwidth win; the copy itself is small against a unified memory bus.
+
+**Element width is the consumer's choice.** Storage is generic over
+`TokenElement`, implemented here for `f32` and `f64`. Implement it for
+`half::f16` or `half::bf16` to keep the wire, the cache and the model at one
+width with no conversion: `f16` halves both the resident window (to ~7.9 MB)
+and the wire rate (to ~768 KB/s at 3 FPS).
+
+**Panics are not caught in the drain loop.** One terminates the task and
+surfaces through the caller's `JoinHandle`, which is what a supervisor should
+watch. There is no in-loop restart.

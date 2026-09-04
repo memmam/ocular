@@ -1,81 +1,160 @@
-use crate::{CompressedFrame, IngestConfig, StreamGuard};
+use crate::{CaptureTimestamp, FrameMeta, IngestConfig, IngestError, StreamGuard, TokenElement};
+use std::time::Instant;
+
+/// Maps a monotonic sequence number onto a slot index.
+///
+/// The remainder is strictly less than `MAX_FIFO_FRAMES` (30), so it always
+/// fits in a `usize` regardless of pointer width.
+#[allow(clippy::cast_possible_truncation)]
+const fn slot_of(sequence: u64) -> usize {
+    (sequence % IngestConfig::MAX_FIFO_FRAMES as u64) as usize
+}
 
 /// Fixed-capacity cyclic cache of the most recent frames.
 ///
-/// The slot vector is allocated once at construction and never grows. Frame
-/// payloads themselves are owned `Vec<f32>` handed over by the producer, so
-/// pushing a frame takes ownership of an existing allocation and dropping the
-/// evicted frame frees one; the hot path is bounded in memory, not
-/// allocation-free.
-pub struct IngestRingBuffer {
-    cache: Vec<Option<CompressedFrame>>,
-    head: usize,
+/// Token storage is one flat, contiguous block sized at construction to
+/// `MAX_FIFO_FRAMES * TOKENS_PER_FRAME * target_dim`. Pushing copies into a
+/// slot; nothing is allocated, moved or freed on the hot path, and the
+/// resident footprint is constant for the life of the cache.
+pub struct IngestRingBuffer<T: TokenElement> {
+    tokens: Vec<T>,
+    meta: Vec<Option<FrameMeta>>,
+    head: u64,
     target_dim: usize,
+    frame_len: usize,
 }
 
-impl IngestRingBuffer {
-    /// Pre-sizes the slot vector at boot time so the push path never reallocates.
+impl<T: TokenElement> IngestRingBuffer<T> {
+    /// Allocates the full token block and slot metadata up front.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `target_dim` is zero, or if the resulting window size
+    /// overflows `usize`.
     #[must_use]
     pub fn new(target_dim: usize) -> Self {
+        assert!(target_dim > 0, "target_dim must be non-zero");
+        let frame_len = IngestConfig::TOKENS_PER_FRAME
+            .checked_mul(target_dim)
+            .expect("frame length overflows usize");
+        let total = frame_len
+            .checked_mul(IngestConfig::MAX_FIFO_FRAMES)
+            .expect("window size overflows usize");
         Self {
-            cache: vec![None; IngestConfig::MAX_FIFO_FRAMES],
+            tokens: vec![T::default(); total],
+            meta: vec![None; IngestConfig::MAX_FIFO_FRAMES],
             head: 0,
             target_dim,
+            frame_len,
         }
     }
 
-    /// Drops the stale frame at the targeted cyclical cell index and binds the incoming payload.
+    /// Validates a token block and copies it into the next slot, overwriting
+    /// the oldest frame once the window is full.
+    ///
+    /// Returns `true` when the write evicted a live frame.
     ///
     /// # Errors
     ///
-    /// Returns a [`StreamGuard`] violation when `frame.token_data` is not
-    /// exactly `IngestConfig::COMPRESSED_DIM * target_dim` elements long. The
-    /// frame is discarded and the cache is left untouched.
-    pub fn push_snapshot(&mut self, frame: CompressedFrame) -> Result<(), &'static str> {
-        let expected_size = IngestConfig::COMPRESSED_DIM * self.target_dim;
-        StreamGuard::verify_tensor_bounds(frame.token_data.len(), expected_size)?;
+    /// Propagates any [`StreamGuard`] rejection. On error the cache is
+    /// untouched and the frame is discarded.
+    pub fn push_snapshot(
+        &mut self,
+        tokens: &[T],
+        capture: CaptureTimestamp,
+        declared_dim: usize,
+    ) -> Result<bool, IngestError> {
+        StreamGuard::verify(tokens, self.frame_len, declared_dim, self.target_dim)?;
 
-        let idx = self.head % IngestConfig::MAX_FIFO_FRAMES;
-        self.cache[idx] = Some(frame);
+        let slot = slot_of(self.head);
+        let start = slot * self.frame_len;
+        self.tokens[start..start + self.frame_len].copy_from_slice(tokens);
+
+        let evicted = self.meta[slot].is_some();
+        self.meta[slot] = Some(FrameMeta {
+            capture,
+            arrival: Instant::now(),
+            sequence: self.head,
+        });
         self.head = self.head.wrapping_add(1);
-        Ok(())
+        Ok(evicted)
     }
 
-    /// Serializes the retained frames oldest-first into one flat block for context insertion.
+    /// Writes the retained window, oldest frame first, into `out`.
     ///
-    /// Allocates a fresh buffer sized to the retained window on every call.
-    #[must_use]
-    pub fn export_linearized_payload(&self) -> Vec<f32> {
-        let mut out_buffer = Vec::with_capacity(
-            IngestConfig::MAX_FIFO_FRAMES * IngestConfig::COMPRESSED_DIM * self.target_dim,
-        );
-
-        let start = self.head.saturating_sub(IngestConfig::MAX_FIFO_FRAMES);
-
-        for i in start..self.head {
-            let idx = i % IngestConfig::MAX_FIFO_FRAMES;
-            if let Some(ref frame) = self.cache[idx] {
-                out_buffer.extend_from_slice(&frame.token_data);
+    /// `out` is cleared and refilled. Reuse one buffer across calls and this
+    /// performs no allocation; size it with [`Self::window_capacity`].
+    pub fn export_into(&self, out: &mut Vec<T>) {
+        out.clear();
+        out.reserve(self.len() * self.frame_len);
+        for sequence in self.oldest_sequence()..self.head {
+            let slot = slot_of(sequence);
+            if self.meta[slot].is_some() {
+                let start = slot * self.frame_len;
+                out.extend_from_slice(&self.tokens[start..start + self.frame_len]);
             }
         }
-        out_buffer
     }
 
-    /// Number of frames currently retained in the cache.
+    /// Allocating convenience wrapper around [`Self::export_into`].
+    ///
+    /// Allocates a buffer sized to the retained window on every call. Prefer
+    /// [`Self::export_into`] on any path that runs more than once.
+    #[must_use]
+    pub fn export_linearized_payload(&self) -> Vec<T> {
+        let mut out = Vec::with_capacity(self.len() * self.frame_len);
+        self.export_into(&mut out);
+        out
+    }
+
+    /// Metadata for the retained frames, oldest first.
+    pub fn frame_metadata(&self) -> impl Iterator<Item = FrameMeta> + '_ {
+        (self.oldest_sequence()..self.head).filter_map(move |sequence| {
+            let slot = slot_of(sequence);
+            self.meta[slot]
+        })
+    }
+
+    fn oldest_sequence(&self) -> u64 {
+        self.head
+            .saturating_sub(IngestConfig::MAX_FIFO_FRAMES as u64)
+    }
+
+    /// Frames currently retained.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.head.min(IngestConfig::MAX_FIFO_FRAMES)
+        usize::try_from(self.head)
+            .unwrap_or(usize::MAX)
+            .min(IngestConfig::MAX_FIFO_FRAMES)
     }
 
-    /// Returns `true` while no frame has been accepted yet.
+    /// True while no frame has been accepted.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.head == 0
     }
 
-    /// Target text-model width this cache validates incoming frames against.
+    /// Elements in one frame: `TOKENS_PER_FRAME * target_dim`.
+    #[must_use]
+    pub fn frame_len(&self) -> usize {
+        self.frame_len
+    }
+
+    /// Elements in a full window. Use this to size an [`Self::export_into`] buffer.
+    #[must_use]
+    pub fn window_capacity(&self) -> usize {
+        self.frame_len * IngestConfig::MAX_FIFO_FRAMES
+    }
+
+    /// Target model width this cache validates against.
     #[must_use]
     pub fn target_dim(&self) -> usize {
         self.target_dim
+    }
+
+    /// Total frames accepted since construction, including evicted ones.
+    #[must_use]
+    pub fn frames_accepted(&self) -> u64 {
+        self.head
     }
 }
