@@ -67,6 +67,7 @@ pub struct IngestRingBuffer<T: TokenElement> {
     target_dim: usize,
     frame_len: usize,
     capacity: usize,
+    staleness_bound: Option<Duration>,
 }
 
 impl<T: TokenElement> IngestRingBuffer<T> {
@@ -109,6 +110,37 @@ impl<T: TokenElement> IngestRingBuffer<T> {
             target_dim,
             frame_len,
             capacity,
+            staleness_bound: None,
+        }
+    }
+
+    /// Caps how old a frame may be and still be exported, whatever policy a
+    /// caller passes.
+    ///
+    /// Export policies are set at the call site, so nothing stops a caller
+    /// asking for the whole window with no age check. On a system that
+    /// actuates, that is the difference between reasoning about where
+    /// something is and where it was. Setting a bound here makes staleness a
+    /// property of the deployment: a policy can narrow it, never widen it.
+    ///
+    /// `None` disables the bound, which is only appropriate where nothing
+    /// downstream acts on the result.
+    pub fn set_staleness_bound(&mut self, max_age: Option<Duration>) {
+        self.staleness_bound = max_age;
+    }
+
+    /// The deployment-level staleness bound, if one is set.
+    #[must_use]
+    pub fn staleness_bound(&self) -> Option<Duration> {
+        self.staleness_bound
+    }
+
+    /// Narrows a caller's age limit by the deployment bound. Never widens it.
+    fn effective_max_age(&self, requested: Option<Duration>) -> Option<Duration> {
+        match (requested, self.staleness_bound) {
+            (Some(caller), Some(bound)) => Some(caller.min(bound)),
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (None, None) => None,
         }
     }
 
@@ -165,6 +197,7 @@ impl<T: TokenElement> IngestRingBuffer<T> {
         }
         let stride = policy.stride.max(1) as u64;
         let max_frames = policy.max_frames.min(self.capacity);
+        let max_age = self.effective_max_age(policy.max_age);
         let now = Instant::now();
         let oldest = self.oldest_sequence();
         let newest = self.head - 1;
@@ -187,7 +220,7 @@ impl<T: TokenElement> IngestRingBuffer<T> {
             let Some(meta) = self.meta[self.slot_of(sequence)] else {
                 break;
             };
-            if let Some(max_age) = policy.max_age {
+            if let Some(max_age) = max_age {
                 // Arrival is monotonic in sequence order, so everything past
                 // the first stale frame is staler still.
                 if now.saturating_duration_since(meta.arrival) > max_age {
@@ -211,17 +244,27 @@ impl<T: TokenElement> IngestRingBuffer<T> {
     ///
     /// `out` is cleared and refilled; pre-size it with [`Self::window_capacity`]
     /// and the call allocates nothing. Returns the number of frames written.
+    ///
+    /// Any [`Self::set_staleness_bound`] applies before `accept` is consulted,
+    /// so a predicate cannot reach a frame the deployment considers too old.
     pub fn export_matching<F>(&self, out: &mut Vec<T>, mut accept: F) -> usize
     where
         F: FnMut(&FrameMeta) -> bool,
     {
         out.clear();
+        let bound = self.staleness_bound;
+        let now = Instant::now();
         let mut count = 0;
         for sequence in self.oldest_sequence()..self.head {
             let slot = self.slot_of(sequence);
             let Some(meta) = self.meta[slot] else {
                 continue;
             };
+            if let Some(max_age) = bound {
+                if now.saturating_duration_since(meta.arrival) > max_age {
+                    continue;
+                }
+            }
             if !accept(&meta) {
                 continue;
             }

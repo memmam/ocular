@@ -491,3 +491,78 @@ async fn orchestrator_honours_a_custom_capacity() {
     assert_eq!(cache.len(), 2);
     assert_eq!(cache.export_linearized_payload().len(), 2 * FRAME_LEN);
 }
+
+// --- staleness is a deployment property on a system that actuates ---
+
+#[test]
+fn staleness_bound_cannot_be_widened_by_a_caller() {
+    let mut cache = IngestRingBuffer::<f32>::new(TEST_DIM);
+    cache.set_staleness_bound(Some(Duration::from_millis(1)));
+    let block = vec![1.0f32; FRAME_LEN];
+    cache
+        .push_snapshot(&block, CaptureTimestamp::from_nanos(1), TEST_DIM)
+        .expect("well-formed frame");
+
+    let mut out = Vec::with_capacity(cache.window_capacity());
+    assert_eq!(cache.export_with(&mut out, &ExportPolicy::all()), 1);
+
+    std::thread::sleep(Duration::from_millis(3));
+
+    // A caller asking for everything, with no age limit of its own, still
+    // cannot reach a frame the deployment considers stale.
+    assert_eq!(cache.export_with(&mut out, &ExportPolicy::all()), 0);
+    // Nor by asking for a wider limit than the bound.
+    let generous = ExportPolicy::recent(30, Duration::from_secs(3600));
+    assert_eq!(cache.export_with(&mut out, &generous), 0);
+    assert!(out.is_empty());
+}
+
+#[test]
+fn staleness_bound_applies_to_event_correlated_export() {
+    let mut cache = IngestRingBuffer::<f32>::new(TEST_DIM);
+    cache.set_staleness_bound(Some(Duration::from_millis(1)));
+    let block = vec![1.0f32; FRAME_LEN];
+    cache
+        .push_snapshot(
+            &block,
+            CaptureTimestamp::from_nanos(5_000_000_000),
+            TEST_DIM,
+        )
+        .expect("well-formed frame");
+
+    let mut out = Vec::with_capacity(cache.window_capacity());
+    let around = |cache: &IngestRingBuffer<f32>, out: &mut Vec<f32>| {
+        cache.export_around(
+            out,
+            CaptureTimestamp::from_nanos(5_000_000_000),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        )
+    };
+    assert_eq!(around(&cache, &mut out), 1);
+
+    std::thread::sleep(Duration::from_millis(3));
+
+    // A reflex event whose frames have since gone stale yields nothing rather
+    // than context describing where something used to be.
+    assert_eq!(around(&cache, &mut out), 0);
+    assert_eq!(cache.export_matching(&mut out, |_| true), 0);
+}
+
+#[test]
+fn a_caller_can_still_narrow_below_the_bound() {
+    let mut cache = IngestRingBuffer::<f32>::new(TEST_DIM);
+    cache.set_staleness_bound(Some(Duration::from_secs(3600)));
+    assert_eq!(cache.staleness_bound(), Some(Duration::from_secs(3600)));
+
+    let block = vec![1.0f32; FRAME_LEN];
+    cache
+        .push_snapshot(&block, CaptureTimestamp::from_nanos(1), TEST_DIM)
+        .expect("well-formed frame");
+
+    let mut out = Vec::with_capacity(cache.window_capacity());
+    std::thread::sleep(Duration::from_millis(3));
+    let strict = ExportPolicy::recent(30, Duration::from_millis(1));
+    assert_eq!(cache.export_with(&mut out, &strict), 0);
+    assert_eq!(cache.export_with(&mut out, &ExportPolicy::all()), 1);
+}

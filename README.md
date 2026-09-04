@@ -107,6 +107,22 @@ needs eyes for some of its work and not the rest, which constrains three things:
   and `stride` thin the selection; `stride` is the cheap one, since consecutive
   frames at a few FPS are largely redundant.
 
+**This crate is deliberative-layer only.** On a system that actuates -- a
+humanoid, or anything driving hardware -- nothing in a balance, collision or
+force loop may depend on this path being responsive. The LLM's timescale is
+hundreds of milliseconds to seconds; a control loop's is milliseconds. Ingest
+is built so it cannot interfere: publishing never blocks, the cache and queue
+are fixed size, and a stalled or panicking drain loop drops frames rather than
+propagating backpressure. It is not built to be read from a real-time context,
+and `push_snapshot` holds the write lock across a full frame copy.
+
+`set_staleness_bound` makes staleness a property of the deployment rather than
+of each call site. Export policies are chosen by callers, so without a bound
+any of them can ask for the whole window with no age check -- on a system that
+acts in the world, the difference between reasoning about where something is
+and where it was. A policy can narrow the bound; it can never widen it, and it
+applies to event-correlated and predicate exports too.
+
 **A reflex path is a separate pipeline, and this crate is the join.** Reacting
 to something in the scene cannot run through here: at 3 FPS a frame arrives
 every 333 ms, already slower than human visual reaction, before inference adds
