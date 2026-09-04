@@ -102,10 +102,18 @@ needs eyes for some of its work and not the rest, which constrains three things:
   stale frames and `newest_age()` reports the gap. Prefer `export_with` over
   `export_into` on any path where ingest may not be running. Call `clear()`
   when a visual task ends so one situation's context cannot leak into the next.
-- *Context budget.* A full window is `30 * TOKENS_PER_FRAME` tokens inserted
-  per turn, competing with the agent's other work. `ExportPolicy::max_frames`
-  and `stride` thin the selection; `stride` is the cheap one, since consecutive
-  frames at a few FPS are largely redundant.
+- *Context budget.* A full window is `capacity * TOKENS_PER_FRAME` tokens
+  inserted per turn, competing with the agent's other work.
+  `ExportPolicy::max_frames`, `stride` and `min_interval` thin the selection.
+  `stride` is positional and assumes a regular cadence; `min_interval` is
+  measured on the sensor clock and holds up when frames arrive irregularly.
+
+**Near-duplicate frames are the sensor side's problem.** Consecutive frames at
+a few FPS are largely redundant, and a luma-difference check before the
+encoder is the cheap way to drop them -- it saves encoder cycles, headset
+battery and wire, not just work here. This crate never sees a pixel, so it
+cannot make that check itself; what it does is not assume a regular frame
+cadence, which is what `min_interval` is for.
 
 **The person acting on the output cannot see how much context the agent had.**
 This is the failure mode a co-deployed wearable has that a robot does not: an

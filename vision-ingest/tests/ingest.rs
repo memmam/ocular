@@ -245,6 +245,7 @@ fn export_policy_limits_frames_and_preserves_order() {
         max_frames: 3,
         max_age: None,
         stride: 1,
+        min_interval: None,
     };
     assert_eq!(cache.export_with(&mut out, &policy).frames, 3);
     assert_eq!(out.len(), 3 * FRAME_LEN);
@@ -665,4 +666,91 @@ fn clear_overwrites_the_token_store() {
         .expect("well-formed frame");
     assert_eq!(cache.export_into(&mut out).frames, 1);
     assert!(out.iter().all(|v| (*v - 0.25).abs() < f32::EPSILON));
+}
+
+// --- pool exhaustion is a sizing notice, not a fault ---
+
+#[tokio::test]
+async fn pool_exhaustion_is_counted_and_published_but_never_fails() {
+    let pool = BufferPool::<f32>::with_buffers(FRAME_LEN, 1);
+    let mut watcher = pool.watch_fallbacks();
+    assert_eq!(*watcher.borrow(), 0);
+
+    let a = pool.acquire();
+    // Pool is empty now; the second acquire allocates rather than failing.
+    let b = pool.acquire();
+    assert_eq!(a.len(), FRAME_LEN);
+    assert_eq!(b.len(), FRAME_LEN);
+    assert_eq!(pool.fallback_allocations(), 1);
+
+    // A supervisor sitting on the channel is woken with the running total.
+    watcher.changed().await.expect("sender alive");
+    assert_eq!(*watcher.borrow_and_update(), 1);
+
+    // Both buffers return on drop, so the pool has grown to fit the demand.
+    drop(a);
+    drop(b);
+    assert_eq!(pool.available(), 2);
+}
+
+// --- thinning by time survives an irregular upstream cadence ---
+
+#[test]
+fn min_interval_thins_by_sensor_clock_not_by_position() {
+    // Capture times in ms: bursty, as after sensor-side dedup.
+    let captures_ms = [0u64, 50, 100, 1000, 1010, 2000, 2005, 2010, 3000];
+    let mut cache = IngestRingBuffer::<f32>::new(TEST_DIM);
+    for (i, ms) in captures_ms.iter().enumerate() {
+        let block = vec![i as f32; FRAME_LEN];
+        cache
+            .push_snapshot(
+                &block,
+                CaptureTimestamp::from_nanos(ms * 1_000_000),
+                TEST_DIM,
+            )
+            .expect("well-formed frame");
+    }
+
+    let mut out = Vec::with_capacity(cache.window_capacity());
+    let policy = ExportPolicy::all().with_min_interval(Duration::from_millis(500));
+    let outcome = cache.export_with(&mut out, &policy);
+
+    // Walking back from 3000ms: 3000, then 2010 is >=500 away -> keep;
+    // 2005 and 2000 are within 500 of 2010 -> skip; 1010 keep; 1000 skip;
+    // 100 keep; 50 and 0 skip. Emitted oldest-first: 100, 1010, 2010, 3000
+    // -> markers 2, 4, 7, 8.
+    assert_eq!(outcome.frames, 4);
+    let markers: Vec<f32> = (0..4).map(|k| out[k * FRAME_LEN]).collect();
+    assert_eq!(markers, vec![2.0, 4.0, 7.0, 8.0]);
+}
+
+#[test]
+fn min_interval_and_stride_compose() {
+    let mut cache = IngestRingBuffer::<f32>::new(TEST_DIM);
+    for i in 0..10u64 {
+        let block = vec![i as f32; FRAME_LEN];
+        cache
+            .push_snapshot(
+                &block,
+                CaptureTimestamp::from_nanos(i * 100_000_000),
+                TEST_DIM,
+            )
+            .expect("well-formed frame");
+    }
+    let mut out = Vec::with_capacity(cache.window_capacity());
+
+    // Stride 2 alone from newest: 9,7,5,3,1.
+    let outcome = cache.export_with(&mut out, &ExportPolicy::all().with_stride(2));
+    assert_eq!(outcome.frames, 5);
+    assert!((out[0] - 1.0).abs() < f32::EPSILON);
+
+    // Stride 2 then a 350ms floor: 9, 7 (200ms, skip), 5 (400ms, keep),
+    // 3 (skip), 1 (keep) -> 1, 5, 9.
+    let policy = ExportPolicy::all()
+        .with_stride(2)
+        .with_min_interval(Duration::from_millis(350));
+    let outcome = cache.export_with(&mut out, &policy);
+    assert_eq!(outcome.frames, 3);
+    let markers: Vec<f32> = (0..3).map(|k| out[k * FRAME_LEN]).collect();
+    assert_eq!(markers, vec![1.0, 5.0, 9.0]);
 }

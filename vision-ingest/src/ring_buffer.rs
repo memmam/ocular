@@ -15,8 +15,13 @@ pub struct ExportPolicy {
     /// check, which is only safe if ingest is known to be running.
     pub max_age: Option<Duration>,
     /// Take every `stride`-th frame working back from the newest. `1` takes
-    /// every frame; `3` thins a 3 FPS stream to roughly one frame per second.
+    /// every frame. Positional, so it assumes a regular cadence: if the sensor
+    /// side skips near-duplicate frames before encoding, prefer `min_interval`.
     pub stride: usize,
+    /// Skip a frame captured closer than this to the previously selected one.
+    /// Measured on the sensor clock, so it holds up when frames arrive at an
+    /// irregular rate. `None` disables it. Applied after `stride`.
+    pub min_interval: Option<Duration>,
 }
 
 impl ExportPolicy {
@@ -27,6 +32,7 @@ impl ExportPolicy {
             max_frames: usize::MAX,
             max_age: None,
             stride: 1,
+            min_interval: None,
         }
     }
 
@@ -37,6 +43,7 @@ impl ExportPolicy {
             max_frames,
             max_age: Some(max_age),
             stride: 1,
+            min_interval: None,
         }
     }
 
@@ -44,6 +51,14 @@ impl ExportPolicy {
     #[must_use]
     pub const fn with_stride(mut self, stride: usize) -> Self {
         self.stride = stride;
+        self
+    }
+
+    /// Thins the selection to frames at least `interval` apart on the sensor
+    /// clock.
+    #[must_use]
+    pub const fn with_min_interval(mut self, interval: Duration) -> Self {
+        self.min_interval = Some(interval);
         self
     }
 }
@@ -244,52 +259,49 @@ impl<T: TokenElement> IngestRingBuffer<T> {
         if self.head == 0 {
             return ExportOutcome::default();
         }
-        let stride = policy.stride.max(1) as u64;
-        let max_frames = policy.max_frames.min(self.capacity);
         let max_age = self.effective_max_age(policy.max_age);
         let now = Instant::now();
-        let oldest = self.oldest_sequence();
-        let newest = self.head - 1;
 
-        // Live frames occupy a contiguous run of sequences ending at `newest`
-        // (`clear` empties the whole window), so the selection can be counted
-        // walking back and then replayed forward. Nothing is stored per frame,
-        // which keeps this allocation-free at any capacity.
-        let mut count: u64 = 0;
-        while usize::try_from(count).unwrap_or(usize::MAX) < max_frames {
-            let Some(sequence) = count
-                .checked_mul(stride)
-                .and_then(|offset| newest.checked_sub(offset))
-            else {
-                break;
-            };
-            if sequence < oldest {
-                break;
-            }
-            let Some(meta) = self.meta[self.slot_of(sequence)] else {
-                break;
-            };
-            if let Some(max_age) = max_age {
-                // Arrival is monotonic in sequence order, so everything past
-                // the first stale frame is staler still.
-                if now.saturating_duration_since(meta.arrival) > max_age {
-                    break;
-                }
-            }
-            count += 1;
+        // Selection is data-dependent once `min_interval` is involved, so it
+        // cannot be replayed arithmetically. Instead the walk runs twice: once
+        // to count, then once to place each frame at its final position. Both
+        // passes touch metadata only until the copy, and nothing is held per
+        // frame, so this stays allocation-free at any capacity.
+        let count = self.select(policy, max_age, now).count();
+        out.resize(count * self.frame_len, T::default());
+        for (index, slot) in self.select(policy, max_age, now).enumerate() {
+            let dst = (count - 1 - index) * self.frame_len;
+            let src = slot * self.frame_len;
+            out[dst..dst + self.frame_len].copy_from_slice(&self.tokens[src..src + self.frame_len]);
         }
 
-        let written = usize::try_from(count).unwrap_or(usize::MAX);
-        out.reserve(written * self.frame_len);
-        for step in (0..count).rev() {
-            let sequence = newest - step * stride;
-            let start = self.slot_of(sequence) * self.frame_len;
-            out.extend_from_slice(&self.tokens[start..start + self.frame_len]);
-        }
         ExportOutcome {
-            frames: written,
+            frames: count,
             excluded_stale: retained - self.fresh_frames(max_age, now),
             retained,
+        }
+    }
+
+    /// Slots selected by `policy`, newest first.
+    fn select<'a>(
+        &'a self,
+        policy: &ExportPolicy,
+        max_age: Option<Duration>,
+        now: Instant,
+    ) -> Selection<'a, T> {
+        Selection {
+            cache: self,
+            sequence: self.head,
+            oldest: self.oldest_sequence(),
+            remaining: policy.max_frames.min(self.capacity),
+            stride: policy.stride.max(1) as u64,
+            seen: 0,
+            max_age,
+            now,
+            min_interval_nanos: policy
+                .min_interval
+                .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)),
+            last_capture_nanos: None,
         }
     }
 
@@ -492,5 +504,58 @@ impl<T: TokenElement> IngestRingBuffer<T> {
     #[must_use]
     pub fn frames_accepted(&self) -> u64 {
         self.head
+    }
+}
+
+/// Newest-first walk over the frames an [`ExportPolicy`] selects.
+///
+/// Live frames occupy a contiguous run of sequences ending at the newest
+/// (`clear` empties the whole window), and arrival time is monotonic in
+/// sequence order, so the first gap or the first stale frame ends the walk.
+struct Selection<'a, T: TokenElement> {
+    cache: &'a IngestRingBuffer<T>,
+    sequence: u64,
+    oldest: u64,
+    remaining: usize,
+    stride: u64,
+    seen: u64,
+    max_age: Option<Duration>,
+    now: Instant,
+    min_interval_nanos: Option<u64>,
+    last_capture_nanos: Option<u64>,
+}
+
+impl<T: TokenElement> Iterator for Selection<'_, T> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        loop {
+            if self.remaining == 0 || self.sequence <= self.oldest {
+                return None;
+            }
+            self.sequence -= 1;
+            let slot = self.cache.slot_of(self.sequence);
+            let meta = self.cache.meta[slot]?;
+            if let Some(max_age) = self.max_age {
+                if self.now.saturating_duration_since(meta.arrival) > max_age {
+                    return None;
+                }
+            }
+            let positional = self.seen % self.stride == 0;
+            self.seen += 1;
+            if !positional {
+                continue;
+            }
+            if let (Some(interval), Some(last)) = (self.min_interval_nanos, self.last_capture_nanos)
+            {
+                // Walking newest-first, capture times decrease.
+                if last.saturating_sub(meta.capture.nanos) < interval {
+                    continue;
+                }
+            }
+            self.last_capture_nanos = Some(meta.capture.nanos);
+            self.remaining -= 1;
+            return Some(slot);
+        }
     }
 }
