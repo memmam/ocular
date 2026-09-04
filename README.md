@@ -80,6 +80,30 @@ bandwidth win; the copy itself is small against a unified memory bus.
 width with no conversion: `f16` halves both the resident window (to ~7.9 MB)
 and the wire rate (to ~768 KB/s at 3 FPS).
 
+**The compute node is a resident agent, not a dedicated vision pipeline.** It
+needs eyes for some of its work and not the rest, which constrains three things:
+
+- *Suspension.* `IngestControl::suspend` gates the path at the sender. While
+  suspended, publishing costs one relaxed atomic load and the leased buffer
+  returns to the pool immediately -- nothing is queued, copied or locked. It
+  does not stop the sensor device transmitting; gate that at the wire too if
+  headset battery matters.
+- *Staleness.* Intermittent ingest means a retained window can be arbitrarily
+  old while looking exactly like live data. `ExportPolicy::max_age` excludes
+  stale frames and `newest_age()` reports the gap. Prefer `export_with` over
+  `export_into` on any path where ingest may not be running. Call `clear()`
+  when a visual task ends so one situation's context cannot leak into the next.
+- *Context budget.* A full window is `30 * TOKENS_PER_FRAME` tokens inserted
+  per turn, competing with the agent's other work. `ExportPolicy::max_frames`
+  and `stride` thin the selection; `stride` is the cheap one, since consecutive
+  frames at a few FPS are largely redundant.
+
+**Nothing here can be made to allocate by a hostile or broken sender.** The
+cache, the pool and the queue are all fixed size, and a full queue drops rather
+than growing. Wire framing and decode happen upstream of this crate and are
+where untrusted parsing actually lives; by the time a block reaches
+`StreamGuard` it is already a typed slice of known length.
+
 **Panics are not caught in the drain loop.** One terminates the task and
 surfaces through the caller's `JoinHandle`, which is what a supervisor should
 watch. There is no in-loop restart.

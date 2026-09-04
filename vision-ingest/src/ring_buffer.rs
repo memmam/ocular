@@ -1,5 +1,5 @@
 use crate::{CaptureTimestamp, FrameMeta, IngestConfig, IngestError, StreamGuard, TokenElement};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Maps a monotonic sequence number onto a slot index.
 ///
@@ -8,6 +8,59 @@ use std::time::Instant;
 #[allow(clippy::cast_possible_truncation)]
 const fn slot_of(sequence: u64) -> usize {
     (sequence % IngestConfig::MAX_FIFO_FRAMES as u64) as usize
+}
+
+/// Selects which retained frames an export writes out.
+///
+/// A resident agent shares its context window with other work, so inserting
+/// the whole window on every turn is rarely what you want: 30 frames is
+/// `30 * TOKENS_PER_FRAME` tokens, and consecutive frames at a few FPS are
+/// largely redundant.
+#[derive(Clone, Copy, Debug)]
+pub struct ExportPolicy {
+    /// Write at most this many frames, counting back from the newest.
+    pub max_frames: usize,
+    /// Skip frames that arrived longer ago than this. `None` disables the
+    /// check, which is only safe if ingest is known to be running.
+    pub max_age: Option<Duration>,
+    /// Take every `stride`-th frame working back from the newest. `1` takes
+    /// every frame; `3` thins a 3 FPS stream to roughly one frame per second.
+    pub stride: usize,
+}
+
+impl ExportPolicy {
+    /// Every retained frame, regardless of age.
+    #[must_use]
+    pub const fn all() -> Self {
+        Self {
+            max_frames: IngestConfig::MAX_FIFO_FRAMES,
+            max_age: None,
+            stride: 1,
+        }
+    }
+
+    /// The newest `max_frames` frames, no older than `max_age`.
+    #[must_use]
+    pub const fn recent(max_frames: usize, max_age: Duration) -> Self {
+        Self {
+            max_frames,
+            max_age: Some(max_age),
+            stride: 1,
+        }
+    }
+
+    /// Thins the selection to every `stride`-th frame.
+    #[must_use]
+    pub const fn with_stride(mut self, stride: usize) -> Self {
+        self.stride = stride;
+        self
+    }
+}
+
+impl Default for ExportPolicy {
+    fn default() -> Self {
+        Self::all()
+    }
 }
 
 /// Fixed-capacity cyclic cache of the most recent frames.
@@ -80,20 +133,82 @@ impl<T: TokenElement> IngestRingBuffer<T> {
         Ok(evicted)
     }
 
-    /// Writes the retained window, oldest frame first, into `out`.
+    /// Writes every retained frame, oldest first, into `out`.
     ///
-    /// `out` is cleared and refilled. Reuse one buffer across calls and this
-    /// performs no allocation; size it with [`Self::window_capacity`].
+    /// Equivalent to [`Self::export_with`] under [`ExportPolicy::all`]. This
+    /// ignores frame age: on an intermittently active ingest path prefer
+    /// [`Self::export_with`] with a `max_age`, or the window may be minutes
+    /// stale and indistinguishable from live data.
     pub fn export_into(&self, out: &mut Vec<T>) {
+        self.export_with(out, &ExportPolicy::all());
+    }
+
+    /// Writes the frames selected by `policy` into `out`, oldest first.
+    ///
+    /// `out` is cleared and refilled; reuse one buffer and this allocates
+    /// nothing. Returns the number of frames written, which is zero when every
+    /// retained frame is older than `policy.max_age`.
+    pub fn export_with(&self, out: &mut Vec<T>, policy: &ExportPolicy) -> usize {
         out.clear();
-        out.reserve(self.len() * self.frame_len);
-        for sequence in self.oldest_sequence()..self.head {
+        let max_frames = policy.max_frames.min(IngestConfig::MAX_FIFO_FRAMES);
+        let stride = policy.stride.max(1);
+        let now = Instant::now();
+
+        // Slot indices, newest first. Bounded by the window, so it stays on the
+        // stack and the export path allocates nothing.
+        let mut chosen = [0usize; IngestConfig::MAX_FIFO_FRAMES];
+        let mut count = 0;
+        let mut live_seen = 0usize;
+        let oldest = self.oldest_sequence();
+        let mut sequence = self.head;
+
+        while sequence > oldest && count < max_frames {
+            sequence -= 1;
             let slot = slot_of(sequence);
-            if self.meta[slot].is_some() {
-                let start = slot * self.frame_len;
-                out.extend_from_slice(&self.tokens[start..start + self.frame_len]);
+            let Some(meta) = self.meta[slot] else {
+                continue;
+            };
+            if let Some(max_age) = policy.max_age {
+                // Arrival is monotonic in sequence order, so everything past
+                // the first stale frame is staler still.
+                if now.saturating_duration_since(meta.arrival) > max_age {
+                    break;
+                }
             }
+            if live_seen % stride == 0 {
+                chosen[count] = slot;
+                count += 1;
+            }
+            live_seen += 1;
         }
+
+        out.reserve(count * self.frame_len);
+        for &slot in chosen[..count].iter().rev() {
+            let start = slot * self.frame_len;
+            out.extend_from_slice(&self.tokens[start..start + self.frame_len]);
+        }
+        count
+    }
+
+    /// Discards every retained frame without freeing the backing store.
+    ///
+    /// Call this when a visual task ends, so context from one situation cannot
+    /// leak into the next. Sequence numbering continues across the clear, which
+    /// leaves the gap visible in [`Self::frame_metadata`].
+    pub fn clear(&mut self) {
+        self.meta.iter_mut().for_each(|slot| *slot = None);
+    }
+
+    /// How long ago the newest retained frame arrived, or `None` when empty.
+    ///
+    /// Use this to decide whether the window is worth inserting at all.
+    #[must_use]
+    pub fn newest_age(&self) -> Option<Duration> {
+        let now = Instant::now();
+        (self.oldest_sequence()..self.head)
+            .rev()
+            .find_map(|sequence| self.meta[slot_of(sequence)])
+            .map(|meta| now.saturating_duration_since(meta.arrival))
     }
 
     /// Allocating convenience wrapper around [`Self::export_into`].

@@ -1,8 +1,55 @@
 use crate::pool::FrameLease;
 use crate::ring_buffer::IngestRingBuffer;
 use crate::{IngestStats, TokenElement};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
+
+/// Suspend/resume gate for the ingest path.
+///
+/// The compute node is a resident agent, not a dedicated vision pipeline: it
+/// only needs eyes for some of its work. While suspended, publishing costs one
+/// relaxed atomic load and the leased buffer goes straight back to the pool --
+/// nothing is queued, copied or locked. Suspending here does not stop the
+/// sensor device transmitting; gate that at the wire too if battery matters.
+#[derive(Debug)]
+pub struct IngestControl {
+    active: AtomicBool,
+}
+
+impl IngestControl {
+    /// Starts active.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            active: AtomicBool::new(true),
+        }
+    }
+
+    /// Accepts frames again. Does not clear frames already retained -- call
+    /// [`crate::ring_buffer::IngestRingBuffer::clear`] first if the previous
+    /// window belongs to a finished task.
+    pub fn resume(&self) {
+        self.active.store(true, Ordering::Relaxed);
+    }
+
+    /// Discards frames at the sender until resumed.
+    pub fn suspend(&self) {
+        self.active.store(false, Ordering::Relaxed);
+    }
+
+    /// Whether frames are currently being accepted.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for IngestControl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Producer handle for the ingest queue.
 ///
@@ -13,6 +60,7 @@ use tokio::sync::{mpsc, RwLock};
 pub struct FrameSender<T: TokenElement> {
     tx: mpsc::Sender<FrameLease<T>>,
     stats: Arc<IngestStats>,
+    control: Arc<IngestControl>,
 }
 
 impl<T: TokenElement> FrameSender<T> {
@@ -23,6 +71,10 @@ impl<T: TokenElement> FrameSender<T> {
     /// know it is falling behind.
     #[must_use]
     pub fn try_publish(&self, frame: FrameLease<T>) -> bool {
+        if !self.control.is_active() {
+            self.stats.record_dropped_suspended();
+            return false;
+        }
         if self.tx.try_send(frame).is_ok() {
             return true;
         }
@@ -35,6 +87,12 @@ impl<T: TokenElement> FrameSender<T> {
     pub fn stats(&self) -> &Arc<IngestStats> {
         &self.stats
     }
+
+    /// Suspend/resume gate for this ingest path.
+    #[must_use]
+    pub fn control(&self) -> &Arc<IngestControl> {
+        &self.control
+    }
 }
 
 impl<T: TokenElement> Clone for FrameSender<T> {
@@ -42,6 +100,7 @@ impl<T: TokenElement> Clone for FrameSender<T> {
         Self {
             tx: self.tx.clone(),
             stats: Arc::clone(&self.stats),
+            control: Arc::clone(&self.control),
         }
     }
 }
@@ -56,6 +115,8 @@ pub struct IngestHandles<T: TokenElement> {
     pub buffer: Arc<RwLock<IngestRingBuffer<T>>>,
     /// Counters covering acceptance, rejection and drops.
     pub stats: Arc<IngestStats>,
+    /// Suspend/resume gate.
+    pub control: Arc<IngestControl>,
 }
 
 impl<T: TokenElement> IngestHandles<T> {
@@ -68,6 +129,7 @@ impl<T: TokenElement> IngestHandles<T> {
     pub fn new(target_dim: usize, max_queue: usize) -> Self {
         let buffer = Arc::new(RwLock::new(IngestRingBuffer::new(target_dim)));
         let stats = Arc::new(IngestStats::new());
+        let control = Arc::new(IngestControl::new());
         let (tx, rx) = mpsc::channel(max_queue);
         Self {
             orchestrator: AsyncIngestOrchestrator {
@@ -78,9 +140,11 @@ impl<T: TokenElement> IngestHandles<T> {
             sender: FrameSender {
                 tx,
                 stats: Arc::clone(&stats),
+                control: Arc::clone(&control),
             },
             buffer,
             stats,
+            control,
         }
     }
 }

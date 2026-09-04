@@ -201,6 +201,7 @@ pub struct IngestStats {
     rejected_dimension: AtomicU64,
     rejected_non_finite: AtomicU64,
     dropped_queue_full: AtomicU64,
+    dropped_suspended: AtomicU64,
     evicted: AtomicU64,
 }
 
@@ -220,6 +221,10 @@ impl IngestStats {
 
     pub(crate) fn record_dropped_queue_full(&self) {
         self.dropped_queue_full.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_dropped_suspended(&self) {
+        self.dropped_suspended.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_rejection(&self, err: IngestError) {
@@ -247,6 +252,12 @@ impl IngestStats {
     #[must_use]
     pub fn dropped_queue_full(&self) -> u64 {
         self.dropped_queue_full.load(Ordering::Relaxed)
+    }
+
+    /// Frames discarded because ingest was suspended.
+    #[must_use]
+    pub fn dropped_suspended(&self) -> u64 {
+        self.dropped_suspended.load(Ordering::Relaxed)
     }
 
     /// Frames refused for a length mismatch.

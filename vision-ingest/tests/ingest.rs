@@ -5,7 +5,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use vision_ingest::orchestrator::IngestHandles;
 use vision_ingest::pool::BufferPool;
-use vision_ingest::ring_buffer::IngestRingBuffer;
+use vision_ingest::ring_buffer::{ExportPolicy, IngestRingBuffer};
 use vision_ingest::{CaptureTimestamp, IngestConfig, IngestError, IngestStats, StreamGuard};
 
 const TEST_DIM: usize = 128;
@@ -226,4 +226,124 @@ async fn cache_is_readable_while_ingest_runs() {
     reader_task.await.expect("reader task");
     assert_eq!(handles.stats.accepted(), 12);
     assert_eq!(handles.stats.rejected_total(), 0);
+}
+
+// --- intermittent residency: the puck is not a dedicated vision pipeline ---
+
+#[test]
+fn export_policy_limits_frames_and_preserves_order() {
+    let mut cache = IngestRingBuffer::<f32>::new(TEST_DIM);
+    for i in 0..10u64 {
+        let block = vec![i as f32; FRAME_LEN];
+        cache
+            .push_snapshot(&block, CaptureTimestamp::from_nanos(i), TEST_DIM)
+            .expect("well-formed frame");
+    }
+
+    let mut out = Vec::with_capacity(cache.window_capacity());
+    let policy = ExportPolicy {
+        max_frames: 3,
+        max_age: None,
+        stride: 1,
+    };
+    assert_eq!(cache.export_with(&mut out, &policy), 3);
+    assert_eq!(out.len(), 3 * FRAME_LEN);
+    // Newest three, still written oldest-first: 7, 8, 9.
+    assert!((out[0] - 7.0).abs() < f32::EPSILON);
+    assert!((out[FRAME_LEN] - 8.0).abs() < f32::EPSILON);
+    assert!((out[2 * FRAME_LEN] - 9.0).abs() < f32::EPSILON);
+}
+
+#[test]
+fn export_stride_thins_the_selection() {
+    let mut cache = IngestRingBuffer::<f32>::new(TEST_DIM);
+    for i in 0..9u64 {
+        let block = vec![i as f32; FRAME_LEN];
+        cache
+            .push_snapshot(&block, CaptureTimestamp::from_nanos(i), TEST_DIM)
+            .expect("well-formed frame");
+    }
+
+    let mut out = Vec::with_capacity(cache.window_capacity());
+    let policy = ExportPolicy::all().with_stride(3);
+    assert_eq!(cache.export_with(&mut out, &policy), 3);
+    // Counting back from the newest in steps of 3: 8, 5, 2 -> emitted 2, 5, 8.
+    assert!((out[0] - 2.0).abs() < f32::EPSILON);
+    assert!((out[FRAME_LEN] - 5.0).abs() < f32::EPSILON);
+    assert!((out[2 * FRAME_LEN] - 8.0).abs() < f32::EPSILON);
+}
+
+#[test]
+fn stale_frames_are_excluded_by_max_age() {
+    let mut cache = IngestRingBuffer::<f32>::new(TEST_DIM);
+    let block = vec![1.0f32; FRAME_LEN];
+    cache
+        .push_snapshot(&block, CaptureTimestamp::from_nanos(1), TEST_DIM)
+        .expect("well-formed frame");
+
+    let mut out = Vec::with_capacity(cache.window_capacity());
+
+    // Generous bound: the frame is current.
+    let fresh = ExportPolicy::recent(30, Duration::from_secs(60));
+    assert_eq!(cache.export_with(&mut out, &fresh), 1);
+
+    // Zero-length bound: everything already counts as stale, so an agent
+    // asking for visual context long after ingest stopped gets nothing rather
+    // than a window it cannot tell is old.
+    std::thread::sleep(Duration::from_millis(2));
+    let strict = ExportPolicy::recent(30, Duration::from_millis(1));
+    assert_eq!(cache.export_with(&mut out, &strict), 0);
+    assert!(out.is_empty());
+
+    assert!(cache.newest_age().expect("one frame retained") >= Duration::from_millis(2));
+}
+
+#[test]
+fn clear_drops_retained_frames_without_reallocating() {
+    let mut cache = IngestRingBuffer::<f32>::new(TEST_DIM);
+    for i in 0..5u64 {
+        let block = vec![i as f32; FRAME_LEN];
+        cache
+            .push_snapshot(&block, CaptureTimestamp::from_nanos(i), TEST_DIM)
+            .expect("well-formed frame");
+    }
+    assert_eq!(cache.len(), 5);
+
+    cache.clear();
+    assert!(cache.newest_age().is_none());
+    assert_eq!(cache.frame_metadata().count(), 0);
+    assert!(cache.export_linearized_payload().is_empty());
+
+    // Still usable, and sequence numbering carries across the gap.
+    let block = vec![99.0f32; FRAME_LEN];
+    cache
+        .push_snapshot(&block, CaptureTimestamp::from_nanos(99), TEST_DIM)
+        .expect("well-formed frame");
+    let meta: Vec<_> = cache.frame_metadata().collect();
+    assert_eq!(meta.len(), 1);
+    assert_eq!(meta[0].sequence, 5);
+}
+
+#[tokio::test]
+async fn suspended_ingest_drops_without_queueing() {
+    let handles = IngestHandles::<f32>::new(TEST_DIM, 8);
+    let pool = BufferPool::<f32>::with_buffers(FRAME_LEN, 4);
+    tokio::spawn(handles.orchestrator.start_orchestration_loop());
+
+    handles.control.suspend();
+    assert!(!handles.control.is_active());
+    assert!(!publish(&pool, &handles.sender, 1.0, 1, TEST_DIM));
+    assert!(!publish(&pool, &handles.sender, 1.0, 2, TEST_DIM));
+
+    assert_eq!(handles.stats.dropped_suspended(), 2);
+    assert_eq!(handles.stats.accepted(), 0);
+    // Nothing was queued, so every buffer came straight back.
+    assert_eq!(pool.available(), 4);
+    assert!(handles.buffer.read().await.is_empty());
+
+    handles.control.resume();
+    assert!(publish(&pool, &handles.sender, 3.0, 3, TEST_DIM));
+    await_frames(&handles.stats, 1, 0).await;
+    assert_eq!(handles.stats.accepted(), 1);
+    assert_eq!(handles.stats.dropped_suspended(), 2);
 }
