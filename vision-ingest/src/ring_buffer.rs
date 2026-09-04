@@ -54,6 +54,49 @@ impl Default for ExportPolicy {
     }
 }
 
+/// What an export actually returned, and what it left out.
+///
+/// On a co-deployed system the person acting on the agent's output cannot see
+/// how much context the agent had. A bare frame count cannot distinguish "the
+/// scene is empty" from "nothing has been ingested for thirty seconds", and an
+/// agent that reports the first when the second is true is confidently wrong
+/// in the direction a human is least able to check. These fields let a caller
+/// tell the two apart and hedge accordingly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExportOutcome {
+    /// Frames written into the output buffer.
+    pub frames: usize,
+    /// Frames held in the cache but excluded for being older than the
+    /// effective age limit.
+    pub excluded_stale: usize,
+    /// Frames the cache held when the call was made, before any filtering.
+    pub retained: usize,
+}
+
+impl ExportOutcome {
+    /// No frames were written.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.frames == 0
+    }
+
+    /// The cache held frames and every one of them was too old.
+    ///
+    /// Distinct from an empty cache: the agent has been looking, and what it
+    /// saw is no longer current. Worth saying out loud rather than answering
+    /// as though the view were live.
+    #[must_use]
+    pub const fn is_stale(&self) -> bool {
+        self.frames == 0 && self.excluded_stale > 0
+    }
+
+    /// Nothing has been ingested, or the window was cleared.
+    #[must_use]
+    pub const fn is_blind(&self) -> bool {
+        self.retained == 0
+    }
+}
+
 /// Fixed-capacity cyclic cache of the most recent frames.
 ///
 /// Token storage is one flat, contiguous block sized at construction to
@@ -67,6 +110,7 @@ pub struct IngestRingBuffer<T: TokenElement> {
     target_dim: usize,
     frame_len: usize,
     capacity: usize,
+    live: usize,
     staleness_bound: Option<Duration>,
 }
 
@@ -110,6 +154,7 @@ impl<T: TokenElement> IngestRingBuffer<T> {
             target_dim,
             frame_len,
             capacity,
+            live: 0,
             staleness_bound: None,
         }
     }
@@ -166,6 +211,9 @@ impl<T: TokenElement> IngestRingBuffer<T> {
         self.tokens[start..start + self.frame_len].copy_from_slice(tokens);
 
         let evicted = self.meta[slot].is_some();
+        if !evicted {
+            self.live += 1;
+        }
         self.meta[slot] = Some(FrameMeta {
             capture,
             arrival: Instant::now(),
@@ -181,8 +229,8 @@ impl<T: TokenElement> IngestRingBuffer<T> {
     /// ignores frame age: on an intermittently active ingest path prefer
     /// [`Self::export_with`] with a `max_age`, or the window may be minutes
     /// stale and indistinguishable from live data.
-    pub fn export_into(&self, out: &mut Vec<T>) {
-        self.export_with(out, &ExportPolicy::all());
+    pub fn export_into(&self, out: &mut Vec<T>) -> ExportOutcome {
+        self.export_with(out, &ExportPolicy::all())
     }
 
     /// Writes the frames selected by `policy` into `out`, oldest first.
@@ -190,10 +238,11 @@ impl<T: TokenElement> IngestRingBuffer<T> {
     /// `out` is cleared and refilled; reuse one buffer and this allocates
     /// nothing. Returns the number of frames written, which is zero when every
     /// retained frame is older than `policy.max_age`.
-    pub fn export_with(&self, out: &mut Vec<T>, policy: &ExportPolicy) -> usize {
+    pub fn export_with(&self, out: &mut Vec<T>, policy: &ExportPolicy) -> ExportOutcome {
         out.clear();
+        let retained = self.len();
         if self.head == 0 {
-            return 0;
+            return ExportOutcome::default();
         }
         let stride = policy.stride.max(1) as u64;
         let max_frames = policy.max_frames.min(self.capacity);
@@ -237,7 +286,33 @@ impl<T: TokenElement> IngestRingBuffer<T> {
             let start = self.slot_of(sequence) * self.frame_len;
             out.extend_from_slice(&self.tokens[start..start + self.frame_len]);
         }
-        written
+        ExportOutcome {
+            frames: written,
+            excluded_stale: retained - self.fresh_frames(max_age, now),
+            retained,
+        }
+    }
+
+    /// Live frames no older than `max_age`. Walks metadata only, so this is
+    /// independent of whatever stride the selection used.
+    fn fresh_frames(&self, max_age: Option<Duration>, now: Instant) -> usize {
+        let Some(max_age) = max_age else {
+            return self.len();
+        };
+        let oldest = self.oldest_sequence();
+        let mut fresh = 0;
+        let mut sequence = self.head;
+        while sequence > oldest {
+            sequence -= 1;
+            let Some(meta) = self.meta[self.slot_of(sequence)] else {
+                break;
+            };
+            if now.saturating_duration_since(meta.arrival) > max_age {
+                break;
+            }
+            fresh += 1;
+        }
+        fresh
     }
 
     /// Writes every frame `accept` returns `true` for, oldest first, into `out`.
@@ -247,13 +322,15 @@ impl<T: TokenElement> IngestRingBuffer<T> {
     ///
     /// Any [`Self::set_staleness_bound`] applies before `accept` is consulted,
     /// so a predicate cannot reach a frame the deployment considers too old.
-    pub fn export_matching<F>(&self, out: &mut Vec<T>, mut accept: F) -> usize
+    pub fn export_matching<F>(&self, out: &mut Vec<T>, mut accept: F) -> ExportOutcome
     where
         F: FnMut(&FrameMeta) -> bool,
     {
         out.clear();
         let bound = self.staleness_bound;
         let now = Instant::now();
+        let retained = self.len();
+        let mut excluded_stale = 0;
         let mut count = 0;
         for sequence in self.oldest_sequence()..self.head {
             let slot = self.slot_of(sequence);
@@ -262,6 +339,7 @@ impl<T: TokenElement> IngestRingBuffer<T> {
             };
             if let Some(max_age) = bound {
                 if now.saturating_duration_since(meta.arrival) > max_age {
+                    excluded_stale += 1;
                     continue;
                 }
             }
@@ -272,7 +350,11 @@ impl<T: TokenElement> IngestRingBuffer<T> {
             out.extend_from_slice(&self.tokens[start..start + self.frame_len]);
             count += 1;
         }
-        count
+        ExportOutcome {
+            frames: count,
+            excluded_stale,
+            retained,
+        }
     }
 
     /// Writes the frames bracketing `centre` in sensor-clock time, oldest first.
@@ -295,7 +377,7 @@ impl<T: TokenElement> IngestRingBuffer<T> {
         centre: CaptureTimestamp,
         before: Duration,
         after: Duration,
-    ) -> usize {
+    ) -> ExportOutcome {
         let span_before = u64::try_from(before.as_nanos()).unwrap_or(u64::MAX);
         let span_after = u64::try_from(after.as_nanos()).unwrap_or(u64::MAX);
         let low = centre.nanos.saturating_sub(span_before);
@@ -310,8 +392,18 @@ impl<T: TokenElement> IngestRingBuffer<T> {
     /// Call this when a visual task ends, so context from one situation cannot
     /// leak into the next. Sequence numbering continues across the clear, which
     /// leaves the gap visible in [`Self::frame_metadata`].
+    ///
+    /// The token store is overwritten, not just unlinked. On a device worn in
+    /// public the difference matters: dropping the metadata alone would leave
+    /// every frame resident and recoverable through a later bug or a memory
+    /// dump. The cost is one pass over the window, paid at a task boundary
+    /// rather than on the ingest path.
     pub fn clear(&mut self) {
         self.meta.iter_mut().for_each(|slot| *slot = None);
+        self.live = 0;
+        self.tokens
+            .iter_mut()
+            .for_each(|value| *value = T::default());
     }
 
     /// How long ago the newest retained frame arrived, or `None` when empty.
@@ -357,17 +449,19 @@ impl<T: TokenElement> IngestRingBuffer<T> {
     }
 
     /// Frames currently retained.
+    ///
+    /// Counts live frames, not elapsed sequence positions, so this drops to
+    /// zero after [`Self::clear`] even though sequence numbering continues.
     #[must_use]
     pub fn len(&self) -> usize {
-        usize::try_from(self.head)
-            .unwrap_or(usize::MAX)
-            .min(self.capacity)
+        self.live
     }
 
-    /// True while no frame has been accepted.
+    /// True when no frame is retained, whether because none has arrived or
+    /// because the window was cleared.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.head == 0
+        self.live == 0
     }
 
     /// Elements in one frame: `TOKENS_PER_FRAME * target_dim`.

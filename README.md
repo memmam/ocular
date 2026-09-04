@@ -107,9 +107,26 @@ needs eyes for some of its work and not the rest, which constrains three things:
   and `stride` thin the selection; `stride` is the cheap one, since consecutive
   frames at a few FPS are largely redundant.
 
+**The person acting on the output cannot see how much context the agent had.**
+This is the failure mode a co-deployed wearable has that a robot does not: an
+actuator working from stale data fails visibly and immediately, while a person
+acting on confident advice fails quietly, because nothing told them the window
+was thin. So an export reports `ExportOutcome`, not a bare count --
+`is_blind()` (nothing ingested, or cleared), `is_stale()` (frames held, all of
+them too old) and `excluded_stale` are distinguishable, and an agent can say
+"I have not had a view recently" instead of answering as though the scene were
+empty.
+
+`clear()` overwrites the token store rather than unlinking it. On a device worn
+in public, dropping metadata alone would leave every frame resident and
+recoverable through a later bug or a memory dump. The cost is one pass over the
+window, paid at a task boundary.
+
 **This crate is deliberative-layer only.** On a system that actuates -- a
 humanoid, or anything driving hardware -- nothing in a balance, collision or
-force loop may depend on this path being responsive. The LLM's timescale is
+force loop may depend on this path being responsive. On a wearable there is no
+such loop -- the person is the actuator and their own reflexes are the safety
+layer -- but the constraint holds for any variant that drives hardware. The LLM's timescale is
 hundreds of milliseconds to seconds; a control loop's is milliseconds. Ingest
 is built so it cannot interfere: publishing never blocks, the cache and queue
 are fixed size, and a stalled or panicking drain loop drops frames rather than

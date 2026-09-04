@@ -211,7 +211,7 @@ async fn cache_is_readable_while_ingest_runs() {
     let reader_task = tokio::spawn(async move {
         let mut out = Vec::with_capacity(FRAME_LEN * IngestConfig::DEFAULT_FIFO_FRAMES);
         for _ in 0..20 {
-            reader.read().await.export_into(&mut out);
+            let _ = reader.read().await.export_into(&mut out);
             assert_eq!(out.len() % FRAME_LEN, 0);
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
@@ -246,7 +246,7 @@ fn export_policy_limits_frames_and_preserves_order() {
         max_age: None,
         stride: 1,
     };
-    assert_eq!(cache.export_with(&mut out, &policy), 3);
+    assert_eq!(cache.export_with(&mut out, &policy).frames, 3);
     assert_eq!(out.len(), 3 * FRAME_LEN);
     // Newest three, still written oldest-first: 7, 8, 9.
     assert!((out[0] - 7.0).abs() < f32::EPSILON);
@@ -266,7 +266,7 @@ fn export_stride_thins_the_selection() {
 
     let mut out = Vec::with_capacity(cache.window_capacity());
     let policy = ExportPolicy::all().with_stride(3);
-    assert_eq!(cache.export_with(&mut out, &policy), 3);
+    assert_eq!(cache.export_with(&mut out, &policy).frames, 3);
     // Counting back from the newest in steps of 3: 8, 5, 2 -> emitted 2, 5, 8.
     assert!((out[0] - 2.0).abs() < f32::EPSILON);
     assert!((out[FRAME_LEN] - 5.0).abs() < f32::EPSILON);
@@ -285,14 +285,14 @@ fn stale_frames_are_excluded_by_max_age() {
 
     // Generous bound: the frame is current.
     let fresh = ExportPolicy::recent(30, Duration::from_secs(60));
-    assert_eq!(cache.export_with(&mut out, &fresh), 1);
+    assert_eq!(cache.export_with(&mut out, &fresh).frames, 1);
 
     // Zero-length bound: everything already counts as stale, so an agent
     // asking for visual context long after ingest stopped gets nothing rather
     // than a window it cannot tell is old.
     std::thread::sleep(Duration::from_millis(2));
     let strict = ExportPolicy::recent(30, Duration::from_millis(1));
-    assert_eq!(cache.export_with(&mut out, &strict), 0);
+    assert_eq!(cache.export_with(&mut out, &strict).frames, 0);
     assert!(out.is_empty());
 
     assert!(cache.newest_age().expect("one frame retained") >= Duration::from_millis(2));
@@ -310,6 +310,8 @@ fn clear_drops_retained_frames_without_reallocating() {
     assert_eq!(cache.len(), 5);
 
     cache.clear();
+    assert!(cache.is_empty());
+    assert_eq!(cache.len(), 0);
     assert!(cache.newest_age().is_none());
     assert_eq!(cache.frame_metadata().count(), 0);
     assert!(cache.export_linearized_payload().is_empty());
@@ -378,7 +380,7 @@ fn export_around_brackets_an_event_time() {
         Duration::from_secs(2),
         Duration::from_secs(2),
     );
-    assert_eq!(written, 5);
+    assert_eq!(written.frames, 5);
     assert_eq!(out.len(), 5 * FRAME_LEN);
     // Frames 3..=7, oldest first.
     for (position, expected) in (3..=7).enumerate() {
@@ -399,7 +401,7 @@ fn export_around_is_asymmetric_and_clamps_at_the_window_edge() {
         Duration::from_secs(3),
         Duration::ZERO,
     );
-    assert_eq!(written, 4); // frames 1..=4
+    assert_eq!(written.frames, 4); // frames 1..=4
     assert!((out[0] - 1.0).abs() < f32::EPSILON);
 
     // An event older than anything retained yields nothing rather than the
@@ -410,7 +412,7 @@ fn export_around_is_asymmetric_and_clamps_at_the_window_edge() {
         Duration::from_secs(1),
         Duration::from_secs(1),
     );
-    assert_eq!(written, 0);
+    assert_eq!(written.frames, 0);
     assert!(out.is_empty());
 }
 
@@ -420,7 +422,7 @@ fn export_matching_accepts_an_arbitrary_predicate() {
     let mut out = Vec::with_capacity(cache.window_capacity());
 
     let written = cache.export_matching(&mut out, |meta| meta.sequence % 2 == 0);
-    assert_eq!(written, 4);
+    assert_eq!(written.frames, 4);
     assert!((out[0] - 0.0).abs() < f32::EPSILON);
     assert!((out[FRAME_LEN] - 2.0).abs() < f32::EPSILON);
 }
@@ -464,9 +466,14 @@ fn export_is_allocation_free_at_a_large_capacity() {
     let mut out = Vec::with_capacity(cache.window_capacity());
     let capacity_before = out.capacity();
     for _ in 0..8 {
-        assert_eq!(cache.export_with(&mut out, &ExportPolicy::all()), 512);
         assert_eq!(
-            cache.export_with(&mut out, &ExportPolicy::all().with_stride(7)),
+            cache.export_with(&mut out, &ExportPolicy::all()).frames,
+            512
+        );
+        assert_eq!(
+            cache
+                .export_with(&mut out, &ExportPolicy::all().with_stride(7))
+                .frames,
             74
         );
     }
@@ -504,16 +511,16 @@ fn staleness_bound_cannot_be_widened_by_a_caller() {
         .expect("well-formed frame");
 
     let mut out = Vec::with_capacity(cache.window_capacity());
-    assert_eq!(cache.export_with(&mut out, &ExportPolicy::all()), 1);
+    assert_eq!(cache.export_with(&mut out, &ExportPolicy::all()).frames, 1);
 
     std::thread::sleep(Duration::from_millis(3));
 
     // A caller asking for everything, with no age limit of its own, still
     // cannot reach a frame the deployment considers stale.
-    assert_eq!(cache.export_with(&mut out, &ExportPolicy::all()), 0);
+    assert_eq!(cache.export_with(&mut out, &ExportPolicy::all()).frames, 0);
     // Nor by asking for a wider limit than the bound.
     let generous = ExportPolicy::recent(30, Duration::from_secs(3600));
-    assert_eq!(cache.export_with(&mut out, &generous), 0);
+    assert_eq!(cache.export_with(&mut out, &generous).frames, 0);
     assert!(out.is_empty());
 }
 
@@ -539,14 +546,14 @@ fn staleness_bound_applies_to_event_correlated_export() {
             Duration::from_secs(10),
         )
     };
-    assert_eq!(around(&cache, &mut out), 1);
+    assert_eq!(around(&cache, &mut out).frames, 1);
 
     std::thread::sleep(Duration::from_millis(3));
 
     // A reflex event whose frames have since gone stale yields nothing rather
     // than context describing where something used to be.
-    assert_eq!(around(&cache, &mut out), 0);
-    assert_eq!(cache.export_matching(&mut out, |_| true), 0);
+    assert_eq!(around(&cache, &mut out).frames, 0);
+    assert_eq!(cache.export_matching(&mut out, |_| true).frames, 0);
 }
 
 #[test]
@@ -563,6 +570,99 @@ fn a_caller_can_still_narrow_below_the_bound() {
     let mut out = Vec::with_capacity(cache.window_capacity());
     std::thread::sleep(Duration::from_millis(3));
     let strict = ExportPolicy::recent(30, Duration::from_millis(1));
-    assert_eq!(cache.export_with(&mut out, &strict), 0);
-    assert_eq!(cache.export_with(&mut out, &ExportPolicy::all()), 1);
+    assert_eq!(cache.export_with(&mut out, &strict).frames, 0);
+    assert_eq!(cache.export_with(&mut out, &ExportPolicy::all()).frames, 1);
+}
+
+// --- co-deployment: the person cannot see how much context the agent had ---
+
+#[test]
+fn an_empty_cache_is_distinguishable_from_a_stale_one() {
+    let mut cache = IngestRingBuffer::<f32>::new(TEST_DIM);
+    cache.set_staleness_bound(Some(Duration::from_millis(1)));
+    let mut out = Vec::with_capacity(cache.window_capacity());
+
+    // Never looked: blind, not stale.
+    let outcome = cache.export_with(&mut out, &ExportPolicy::all());
+    assert!(outcome.is_blind());
+    assert!(!outcome.is_stale());
+    assert_eq!(outcome.retained, 0);
+
+    let block = vec![1.0f32; FRAME_LEN];
+    for i in 0..3u64 {
+        cache
+            .push_snapshot(&block, CaptureTimestamp::from_nanos(i), TEST_DIM)
+            .expect("well-formed frame");
+    }
+
+    // Looking now: neither blind nor stale.
+    let outcome = cache.export_with(&mut out, &ExportPolicy::all());
+    assert_eq!(outcome.frames, 3);
+    assert_eq!(outcome.excluded_stale, 0);
+    assert!(!outcome.is_blind() && !outcome.is_stale());
+
+    std::thread::sleep(Duration::from_millis(3));
+
+    // Looked, but the view is old. An agent that reported this the same way it
+    // reports an empty scene would be confidently wrong.
+    let outcome = cache.export_with(&mut out, &ExportPolicy::all());
+    assert!(outcome.is_empty());
+    assert!(outcome.is_stale());
+    assert!(!outcome.is_blind());
+    assert_eq!(outcome.retained, 3);
+    assert_eq!(outcome.excluded_stale, 3);
+}
+
+#[test]
+fn outcome_reports_staleness_on_event_correlated_export() {
+    let mut cache = IngestRingBuffer::<f32>::new(TEST_DIM);
+    cache.set_staleness_bound(Some(Duration::from_millis(1)));
+    let block = vec![1.0f32; FRAME_LEN];
+    cache
+        .push_snapshot(&block, CaptureTimestamp::from_nanos(9), TEST_DIM)
+        .expect("well-formed frame");
+
+    let mut out = Vec::with_capacity(cache.window_capacity());
+    std::thread::sleep(Duration::from_millis(3));
+    let outcome = cache.export_around(
+        &mut out,
+        CaptureTimestamp::from_nanos(9),
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+    );
+    assert!(outcome.is_stale());
+    assert_eq!(outcome.excluded_stale, 1);
+}
+
+#[test]
+fn clear_overwrites_the_token_store() {
+    let mut cache = IngestRingBuffer::<f32>::new(TEST_DIM);
+    let block = vec![7.5f32; FRAME_LEN];
+    cache
+        .push_snapshot(&block, CaptureTimestamp::from_nanos(1), TEST_DIM)
+        .expect("well-formed frame");
+
+    let mut out = Vec::with_capacity(cache.window_capacity());
+    assert_eq!(cache.export_into(&mut out).frames, 1);
+    assert!((out[0] - 7.5).abs() < f32::EPSILON);
+
+    cache.clear();
+
+    // Push a frame the guard rejects, so nothing overwrites the slot, then
+    // read the window back: the old contents must not resurface.
+    let short = vec![0.0f32; 8];
+    assert!(cache
+        .push_snapshot(&short, CaptureTimestamp::from_nanos(2), TEST_DIM)
+        .is_err());
+    let outcome = cache.export_into(&mut out);
+    assert!(outcome.is_blind());
+    assert!(out.is_empty());
+
+    // Refill the same slot and confirm no residue of 7.5 anywhere in it.
+    let fresh = vec![0.25f32; FRAME_LEN];
+    cache
+        .push_snapshot(&fresh, CaptureTimestamp::from_nanos(3), TEST_DIM)
+        .expect("well-formed frame");
+    assert_eq!(cache.export_into(&mut out).frames, 1);
+    assert!(out.iter().all(|v| (*v - 0.25).abs() < f32::EPSILON));
 }
