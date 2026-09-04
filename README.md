@@ -50,6 +50,19 @@ sensor side actually delivers. With durable storage downstream it is really a
 decision deadline: how long the agent has to notice something and commit it
 before it rolls off. That belongs to the deployment, not to this crate.
 
+**Swapping the sensor device, the encoder, or the model is a reconfiguration,
+not a code change.** Each of those shows up here as a different `FrameShape`
+or element type. Build a new cache with the new shape and retire the old one;
+there is deliberately no in-place reshape, because a shape change means the
+retained frames are no longer comparable with the new ones. Until the switch
+is made, the guard rejects the new geometry and `rejected_shape` climbs, which
+is the signal a supervisor should act on.
+
+Whether the projection to the model's width runs on the sensor side or here
+is the one placement decision that couples a sensor to a model. This crate
+handles either: it ingests whatever fixed-shape block arrives, from a wire or
+from a local encoder.
+
 ## Design notes
 
 **`FrameShape` is a cross-device contract.** The sensor side's output geometry
@@ -107,7 +120,7 @@ needs eyes for some of its work and not the rest.
 
 **Near-duplicate frames are the sensor side's problem.** A luma-difference
 check before the encoder is the cheap way to drop them, and it saves encoder
-cycles, headset battery and wire, not just work here. This crate cannot make
+cycles, sensor-side battery and wire, not just work here. This crate cannot make
 that check; what it does is not assume a regular frame cadence.
 
 **The person acting on the output cannot see how much context the agent had.**

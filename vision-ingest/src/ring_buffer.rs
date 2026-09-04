@@ -139,6 +139,11 @@ impl<T: TokenElement> IngestRingBuffer<T> {
     /// side actually delivers, and its resident cost is
     /// `capacity * shape.elements()` elements. Both belong to the deployment.
     ///
+    /// A change of sensor device, encoder, or model arrives here as a
+    /// different `shape`. Build a new cache for it and retire this one; there
+    /// is deliberately no in-place reshape, since frames of the old geometry
+    /// are not comparable with the new.
+    ///
     /// # Panics
     ///
     /// Panics if `shape` has a zero dimension, `capacity` is zero, or the
