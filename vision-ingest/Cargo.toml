@@ -1,0 +1,20 @@
+[package]
+name = "vision-ingest"
+description = "Bounded, snapshot-driven ingest buffer for compressed visual tokens feeding a local LLM context."
+categories = ["multimedia::video", "asynchronous"]
+keywords = ["vision", "ingest", "ring-buffer", "tokio"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+readme = "../README.md"
+repository.workspace = true
+
+[dependencies]
+tokio = { version = "1.0", features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+# `macros` is required by `#[tokio::test]`; `rt` provides the current-thread
+# runtime those tests are driven on. Neither is needed by the library itself.
+tokio = { version = "1.0", features = ["macros", "rt"] }
