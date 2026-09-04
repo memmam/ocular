@@ -1,12 +1,12 @@
-use crate::{CaptureTimestamp, FrameMeta, IngestConfig, IngestError, StreamGuard, TokenElement};
+use crate::{CaptureTimestamp, FrameMeta, FrameShape, IngestError, StreamGuard, TokenElement};
 use std::time::{Duration, Instant};
 
 /// Selects which retained frames an export writes out.
 ///
 /// A resident agent shares its context window with other work, so inserting
 /// the whole window on every turn is rarely what you want: a full window is
-/// `capacity * TOKENS_PER_FRAME` tokens, and consecutive frames at a few FPS
-/// are largely redundant. `max_frames` is clamped to the cache's capacity.
+/// `capacity * shape.tokens` tokens. `max_frames` is clamped to the cache's
+/// capacity.
 #[derive(Clone, Copy, Debug)]
 pub struct ExportPolicy {
     /// Write at most this many frames, counting back from the newest.
@@ -73,10 +73,10 @@ impl Default for ExportPolicy {
 ///
 /// On a co-deployed system the person acting on the agent's output cannot see
 /// how much context the agent had. A bare frame count cannot distinguish "the
-/// scene is empty" from "nothing has been ingested for thirty seconds", and an
-/// agent that reports the first when the second is true is confidently wrong
-/// in the direction a human is least able to check. These fields let a caller
-/// tell the two apart and hedge accordingly.
+/// scene is empty" from "nothing has been ingested for a while", and an agent
+/// that reports the first when the second is true is confidently wrong in the
+/// direction a human is least able to check. These fields let a caller tell
+/// the two apart and hedge accordingly.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ExportOutcome {
     /// Frames written into the output buffer.
@@ -115,14 +115,14 @@ impl ExportOutcome {
 /// Fixed-capacity cyclic cache of the most recent frames.
 ///
 /// Token storage is one flat, contiguous block sized at construction to
-/// `capacity * TOKENS_PER_FRAME * target_dim`. Pushing copies into a
-/// slot; nothing is allocated, moved or freed on the hot path, and the
-/// resident footprint is constant for the life of the cache.
+/// `capacity * shape.elements()`. Pushing copies into a slot; nothing is
+/// allocated, moved or freed on the hot path, and the resident footprint is
+/// constant for the life of the cache.
 pub struct IngestRingBuffer<T: TokenElement> {
     tokens: Vec<T>,
     meta: Vec<Option<FrameMeta>>,
     head: u64,
-    target_dim: usize,
+    shape: FrameShape,
     frame_len: usize,
     capacity: usize,
     live: usize,
@@ -130,35 +130,27 @@ pub struct IngestRingBuffer<T: TokenElement> {
 }
 
 impl<T: TokenElement> IngestRingBuffer<T> {
-    /// Allocates a cache holding [`IngestConfig::DEFAULT_FIFO_FRAMES`] frames.
+    /// Allocates a cache holding `capacity` frames of `shape`.
+    ///
+    /// `capacity` is the retention window. With durable storage downstream it
+    /// is really a decision deadline: how long the agent has to notice
+    /// something and commit it somewhere permanent before it rolls off. The
+    /// window's duration is `capacity` divided by whatever rate the sensor
+    /// side actually delivers, and its resident cost is
+    /// `capacity * shape.elements()` elements. Both belong to the deployment.
     ///
     /// # Panics
     ///
-    /// Panics if `target_dim` is zero, or if the window size overflows `usize`.
+    /// Panics if `shape` has a zero dimension, `capacity` is zero, or the
+    /// window size overflows `usize`.
     #[must_use]
-    pub fn new(target_dim: usize) -> Self {
-        Self::with_capacity(target_dim, IngestConfig::DEFAULT_FIFO_FRAMES)
-    }
-
-    /// Allocates a cache holding `capacity` frames.
-    ///
-    /// `capacity` is the retention window, and on a system with durable storage
-    /// downstream it is really a decision deadline: how long the agent has to
-    /// notice something and commit it somewhere permanent before it rolls off.
-    /// At `f` frames per second the window lasts `capacity / f` seconds and
-    /// costs `capacity * TOKENS_PER_FRAME * target_dim` elements resident.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `target_dim` or `capacity` is zero, or if the window size
-    /// overflows `usize`.
-    #[must_use]
-    pub fn with_capacity(target_dim: usize, capacity: usize) -> Self {
-        assert!(target_dim > 0, "target_dim must be non-zero");
+    pub fn new(shape: FrameShape, capacity: usize) -> Self {
+        assert!(
+            shape.tokens > 0 && shape.dim > 0,
+            "frame shape must be non-zero"
+        );
         assert!(capacity > 0, "capacity must be non-zero");
-        let frame_len = IngestConfig::TOKENS_PER_FRAME
-            .checked_mul(target_dim)
-            .expect("frame length overflows usize");
+        let frame_len = shape.elements();
         let total = frame_len
             .checked_mul(capacity)
             .expect("window size overflows usize");
@@ -166,7 +158,7 @@ impl<T: TokenElement> IngestRingBuffer<T> {
             tokens: vec![T::default(); total],
             meta: vec![None; capacity],
             head: 0,
-            target_dim,
+            shape,
             frame_len,
             capacity,
             live: 0,
@@ -178,13 +170,10 @@ impl<T: TokenElement> IngestRingBuffer<T> {
     /// caller passes.
     ///
     /// Export policies are set at the call site, so nothing stops a caller
-    /// asking for the whole window with no age check. On a system that
-    /// actuates, that is the difference between reasoning about where
-    /// something is and where it was. Setting a bound here makes staleness a
-    /// property of the deployment: a policy can narrow it, never widen it.
-    ///
-    /// `None` disables the bound, which is only appropriate where nothing
-    /// downstream acts on the result.
+    /// asking for the whole window with no age check. Setting a bound here
+    /// makes staleness a property of the deployment: a policy can narrow it,
+    /// never widen it. `None` disables the bound, which is only appropriate
+    /// where nothing downstream acts on the result.
     pub fn set_staleness_bound(&mut self, max_age: Option<Duration>) {
         self.staleness_bound = max_age;
     }
@@ -217,9 +206,9 @@ impl<T: TokenElement> IngestRingBuffer<T> {
         &mut self,
         tokens: &[T],
         capture: CaptureTimestamp,
-        declared_dim: usize,
+        declared: FrameShape,
     ) -> Result<bool, IngestError> {
-        StreamGuard::verify(tokens, self.frame_len, declared_dim, self.target_dim)?;
+        StreamGuard::verify(tokens, self.shape, declared)?;
 
         let slot = self.slot_of(self.head);
         let start = slot * self.frame_len;
@@ -241,18 +230,17 @@ impl<T: TokenElement> IngestRingBuffer<T> {
     /// Writes every retained frame, oldest first, into `out`.
     ///
     /// Equivalent to [`Self::export_with`] under [`ExportPolicy::all`]. This
-    /// ignores frame age: on an intermittently active ingest path prefer
-    /// [`Self::export_with`] with a `max_age`, or the window may be minutes
-    /// stale and indistinguishable from live data.
+    /// ignores frame age unless a staleness bound is set: on an intermittently
+    /// active ingest path prefer [`Self::export_with`] with a `max_age`, or
+    /// the window may be minutes stale and indistinguishable from live data.
     pub fn export_into(&self, out: &mut Vec<T>) -> ExportOutcome {
         self.export_with(out, &ExportPolicy::all())
     }
 
     /// Writes the frames selected by `policy` into `out`, oldest first.
     ///
-    /// `out` is cleared and refilled; reuse one buffer and this allocates
-    /// nothing. Returns the number of frames written, which is zero when every
-    /// retained frame is older than `policy.max_age`.
+    /// `out` is cleared and refilled; reuse one buffer sized with
+    /// [`Self::window_capacity`] and this allocates nothing.
     pub fn export_with(&self, out: &mut Vec<T>, policy: &ExportPolicy) -> ExportOutcome {
         out.clear();
         let retained = self.len();
@@ -330,7 +318,7 @@ impl<T: TokenElement> IngestRingBuffer<T> {
     /// Writes every frame `accept` returns `true` for, oldest first, into `out`.
     ///
     /// `out` is cleared and refilled; pre-size it with [`Self::window_capacity`]
-    /// and the call allocates nothing. Returns the number of frames written.
+    /// and the call allocates nothing.
     ///
     /// Any [`Self::set_staleness_bound`] applies before `accept` is consulted,
     /// so a predicate cannot reach a frame the deployment considers too old.
@@ -371,18 +359,18 @@ impl<T: TokenElement> IngestRingBuffer<T> {
 
     /// Writes the frames bracketing `centre` in sensor-clock time, oldest first.
     ///
-    /// This is the join between a fast reflex path and the deliberative one.
-    /// A frame-rate detector running upstream reports an event at some capture
-    /// time; the agent then pulls the visual context around that moment out of
-    /// here rather than the newest frames, which by the time it is woken are
-    /// not the ones the event refers to.
+    /// This is the join between a fast detection path and the deliberative
+    /// one. A detector running upstream reports an event at some capture
+    /// time; the agent then pulls the visual context around that moment out
+    /// of here rather than the newest frames, which by the time it is woken
+    /// are not the ones the event refers to.
     ///
     /// Selection is by [`CaptureTimestamp`], the sensor device's clock, so the
     /// detector and this cache must be reading the same clock. Arrival time on
     /// this node is not comparable and is not used.
     ///
-    /// Returns the number of frames written, which is zero if the event
-    /// predates the retained window.
+    /// Yields nothing if the event predates the retained window, rather than
+    /// falling back to the nearest frames and misattributing context.
     pub fn export_around(
         &self,
         out: &mut Vec<T>,
@@ -412,15 +400,13 @@ impl<T: TokenElement> IngestRingBuffer<T> {
     /// rather than on the ingest path.
     pub fn clear(&mut self) {
         self.meta.iter_mut().for_each(|slot| *slot = None);
-        self.live = 0;
         self.tokens
             .iter_mut()
             .for_each(|value| *value = T::default());
+        self.live = 0;
     }
 
     /// How long ago the newest retained frame arrived, or `None` when empty.
-    ///
-    /// Use this to decide whether the window is worth inserting at all.
     #[must_use]
     pub fn newest_age(&self) -> Option<Duration> {
         let now = Instant::now();
@@ -430,23 +416,10 @@ impl<T: TokenElement> IngestRingBuffer<T> {
             .map(|meta| now.saturating_duration_since(meta.arrival))
     }
 
-    /// Allocating convenience wrapper around [`Self::export_into`].
-    ///
-    /// Allocates a buffer sized to the retained window on every call. Prefer
-    /// [`Self::export_into`] on any path that runs more than once.
-    #[must_use]
-    pub fn export_linearized_payload(&self) -> Vec<T> {
-        let mut out = Vec::with_capacity(self.len() * self.frame_len);
-        self.export_into(&mut out);
-        out
-    }
-
     /// Metadata for the retained frames, oldest first.
     pub fn frame_metadata(&self) -> impl Iterator<Item = FrameMeta> + '_ {
-        (self.oldest_sequence()..self.head).filter_map(move |sequence| {
-            let slot = self.slot_of(sequence);
-            self.meta[slot]
-        })
+        (self.oldest_sequence()..self.head)
+            .filter_map(move |sequence| self.meta[self.slot_of(sequence)])
     }
 
     fn oldest_sequence(&self) -> u64 {
@@ -460,10 +433,8 @@ impl<T: TokenElement> IngestRingBuffer<T> {
         (sequence % self.capacity as u64) as usize
     }
 
-    /// Frames currently retained.
-    ///
-    /// Counts live frames, not elapsed sequence positions, so this drops to
-    /// zero after [`Self::clear`] even though sequence numbering continues.
+    /// Frames currently retained. Counts live frames, not elapsed sequence
+    /// positions, so this drops to zero after [`Self::clear`].
     #[must_use]
     pub fn len(&self) -> usize {
         self.live
@@ -476,13 +447,13 @@ impl<T: TokenElement> IngestRingBuffer<T> {
         self.live == 0
     }
 
-    /// Elements in one frame: `TOKENS_PER_FRAME * target_dim`.
+    /// Elements in one frame: `shape.elements()`.
     #[must_use]
     pub fn frame_len(&self) -> usize {
         self.frame_len
     }
 
-    /// Elements in a full window. Use this to size an [`Self::export_into`] buffer.
+    /// Elements in a full window. Use this to size an export buffer.
     #[must_use]
     pub fn window_capacity(&self) -> usize {
         self.frame_len * self.capacity
@@ -494,10 +465,10 @@ impl<T: TokenElement> IngestRingBuffer<T> {
         self.capacity
     }
 
-    /// Target model width this cache validates against.
+    /// Frame geometry this cache validates against.
     #[must_use]
-    pub fn target_dim(&self) -> usize {
-        self.target_dim
+    pub fn shape(&self) -> FrameShape {
+        self.shape
     }
 
     /// Total frames accepted since construction, including evicted ones.

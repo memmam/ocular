@@ -1,38 +1,40 @@
 #![deny(unsafe_code)]
 #![warn(clippy::pedantic, clippy::cargo)]
 
-//! Bounded ingest path for compressed visual tokens arriving from a remote
-//! sensor device.
+//! Bounded ingest path for visual token blocks arriving from a remote sensor
+//! device, feeding a resident agent that only sometimes needs to see.
 //!
 //! # Topology
 //!
-//! Perception and language run on separate machines. The sensor device encodes
-//! a frame and projects it to `TOKENS_PER_FRAME * target_dim` elements; this
-//! crate runs on the compute node and owns everything downstream of the wire:
+//! Perception and language run on separate machines. The sensor device
+//! encodes a frame and ships a fixed-shape token block; this crate runs on
+//! the compute node and owns everything downstream of the wire.
 //!
 //! ```text
-//! [sensor device: encoder + resampler] --wire--> [receive task]
-//!     -> FrameSender::try_publish (drop-oldest, never blocks the wire)
-//!     -> AsyncIngestOrchestrator (drain loop)
-//!     -> IngestRingBuffer (fixed slots, copy-in, no allocation)
-//!     -> export_into(&mut Vec<T>) -> LLM context insertion
+//! [sensor device: encoder] --wire--> [receive task]
+//!     -> FrameSender::try_publish        (drop-oldest, never blocks the wire)
+//!     -> AsyncIngestOrchestrator         (drain loop)
+//!     -> StreamGuard                     (shape + finiteness)
+//!     -> IngestRingBuffer                (fixed slots, copy-in, no allocation)
+//!     -> export_with / export_around     (into a caller-owned buffer)
 //! ```
+//!
+//! The crate never sees a pixel and makes no assumption about frame rate,
+//! model, or token count. Frame geometry is a [`FrameShape`] the deployment
+//! supplies; the retention window is a capacity the deployment supplies.
 //!
 //! # Allocation
 //!
 //! Every buffer is allocated during construction. In steady state the ingest
 //! path performs no heap allocation: frames are copied into pre-sized slots,
 //! wire buffers are leased from a [`pool::BufferPool`] and returned on drop,
-//! and [`ring_buffer::IngestRingBuffer::export_into`] fills a caller-owned
-//! buffer. [`ring_buffer::IngestRingBuffer::export_linearized_payload`] is a
-//! convenience wrapper that does allocate, and says so.
+//! and exports fill a caller-owned buffer.
 //!
 //! # Element type
 //!
 //! Storage is generic over [`TokenElement`]. `f32` and `f64` are implemented
 //! here; implement it for `half::f16` or `half::bf16` to keep the wire, the
-//! cache and the model at one width with no conversion. Matching the model's
-//! width halves the resident window relative to `f32`.
+//! cache and the model at one width with no conversion.
 
 pub mod orchestrator;
 pub mod pool;
@@ -42,22 +44,38 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-/// Dimension primitives for a SigLIP-class encoder feeding a local text model.
-pub struct IngestConfig;
-impl IngestConfig {
-    /// Patch sequence length of one encoded snapshot (27x27 grid, 384px, patch 14).
-    /// Published for the sensor device to size against; unused on this side.
-    pub const PATCH_COUNT: usize = 729;
-    /// Hidden width of the visual encoder. Published for the sensor device.
-    pub const ENCODER_DIM: usize = 1152;
-    /// Tokens emitted per frame by the resampler. A sequence length, not a
-    /// vector width: one frame carries `TOKENS_PER_FRAME * target_dim` elements.
-    pub const TOKENS_PER_FRAME: usize = 64;
-    /// Default depth of the timeline cache (10s at 3 FPS). A starting point,
-    /// not a limit: size the window with
-    /// [`ring_buffer::IngestRingBuffer::with_capacity`] to whatever the
-    /// deployment's capture rate and decide-and-commit latency call for.
-    pub const DEFAULT_FIFO_FRAMES: usize = 30;
+/// Geometry of one frame's token block.
+///
+/// Supplied by the deployment to match whatever the sensor side emits. This
+/// crate does not care what produced it, only that every frame has the same
+/// shape and that both machines agree on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FrameShape {
+    /// Tokens per frame.
+    pub tokens: usize,
+    /// Elements per token, i.e. the width of the model the block was
+    /// projected for.
+    pub dim: usize,
+}
+
+impl FrameShape {
+    #[must_use]
+    pub const fn new(tokens: usize, dim: usize) -> Self {
+        Self { tokens, dim }
+    }
+
+    /// Elements in one frame.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the product overflows `usize`.
+    #[must_use]
+    pub const fn elements(self) -> usize {
+        match self.tokens.checked_mul(self.dim) {
+            Some(n) => n,
+            None => panic!("frame shape overflows usize"),
+        }
+    }
 }
 
 /// Element type of a token block.
@@ -86,8 +104,8 @@ impl TokenElement for f64 {
 
 /// Capture time as measured by the sensor device.
 ///
-/// Nanoseconds against an epoch the two machines agree on. This is deliberately
-/// not [`std::time::Instant`]: an `Instant` is opaque, process-local and has no
+/// Nanoseconds against an epoch the two machines agree on. Deliberately not
+/// [`std::time::Instant`]: an `Instant` is opaque, process-local and has no
 /// constructor from a raw value, so it cannot cross a wire.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CaptureTimestamp {
@@ -116,13 +134,16 @@ pub struct FrameMeta {
 /// Reason a frame was refused entry to the cache.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IngestError {
-    /// Token block length did not match the configured geometry. Usually means
-    /// the sensor device is projecting to a different width than this node's
-    /// model expects.
+    /// Token block length did not match the configured shape. Usually means
+    /// the sensor device is emitting a different geometry than this node
+    /// was configured for.
     LengthMismatch { expected: usize, actual: usize },
-    /// Frame declared a target width other than the one this cache validates
+    /// Frame declared a shape other than the one this cache validates
     /// against, even though its length happened to match.
-    DimensionMismatch { expected: usize, actual: usize },
+    ShapeMismatch {
+        expected: FrameShape,
+        actual: FrameShape,
+    },
     /// Block contained a NaN or an infinity. Left unchecked these propagate
     /// through attention and silently poison every subsequent token.
     NonFiniteElement { index: usize },
@@ -135,9 +156,10 @@ impl fmt::Display for IngestError {
                 f,
                 "token block length {actual} does not match expected {expected}"
             ),
-            Self::DimensionMismatch { expected, actual } => write!(
+            Self::ShapeMismatch { expected, actual } => write!(
                 f,
-                "frame declares target width {actual}, cache validates against {expected}"
+                "frame declares shape {}x{}, cache validates against {}x{}",
+                actual.tokens, actual.dim, expected.tokens, expected.dim
             ),
             Self::NonFiniteElement { index } => {
                 write!(f, "non-finite element at index {index}")
@@ -162,25 +184,25 @@ impl StreamGuard {
     /// # Errors
     ///
     /// [`IngestError::LengthMismatch`] when the block is not exactly
-    /// `expected_len` elements, [`IngestError::DimensionMismatch`] when the
-    /// frame's declared width disagrees with the cache's, and
+    /// `expected.elements()` long, [`IngestError::ShapeMismatch`] when the
+    /// frame's declared shape disagrees with the cache's, and
     /// [`IngestError::NonFiniteElement`] on the first NaN or infinity found.
     pub fn verify<T: TokenElement>(
         tokens: &[T],
-        expected_len: usize,
-        declared_dim: usize,
-        expected_dim: usize,
+        expected: FrameShape,
+        declared: FrameShape,
     ) -> Result<(), IngestError> {
+        let expected_len = expected.elements();
         if tokens.len() != expected_len {
             return Err(IngestError::LengthMismatch {
                 expected: expected_len,
                 actual: tokens.len(),
             });
         }
-        if declared_dim != expected_dim {
-            return Err(IngestError::DimensionMismatch {
-                expected: expected_dim,
-                actual: declared_dim,
+        if declared != expected {
+            return Err(IngestError::ShapeMismatch {
+                expected,
+                actual: declared,
             });
         }
         for (index, value) in tokens.iter().enumerate() {
@@ -194,14 +216,14 @@ impl StreamGuard {
 
 /// Observable counters for the ingest path.
 ///
-/// A width disagreement between the sensor device and this node rejects every
+/// A shape disagreement between the sensor device and this node rejects every
 /// frame. That must be visible to a supervisor rather than printed to stderr,
 /// so rejections are counted here by cause.
 #[derive(Debug, Default)]
 pub struct IngestStats {
     accepted: AtomicU64,
     rejected_length: AtomicU64,
-    rejected_dimension: AtomicU64,
+    rejected_shape: AtomicU64,
     rejected_non_finite: AtomicU64,
     dropped_queue_full: AtomicU64,
     dropped_suspended: AtomicU64,
@@ -233,7 +255,7 @@ impl IngestStats {
     pub(crate) fn record_rejection(&self, err: IngestError) {
         let counter = match err {
             IngestError::LengthMismatch { .. } => &self.rejected_length,
-            IngestError::DimensionMismatch { .. } => &self.rejected_dimension,
+            IngestError::ShapeMismatch { .. } => &self.rejected_shape,
             IngestError::NonFiniteElement { .. } => &self.rejected_non_finite,
         };
         counter.fetch_add(1, Ordering::Relaxed);
@@ -269,10 +291,10 @@ impl IngestStats {
         self.rejected_length.load(Ordering::Relaxed)
     }
 
-    /// Frames refused for a declared-width mismatch.
+    /// Frames refused for a declared-shape mismatch.
     #[must_use]
-    pub fn rejected_dimension(&self) -> u64 {
-        self.rejected_dimension.load(Ordering::Relaxed)
+    pub fn rejected_shape(&self) -> u64 {
+        self.rejected_shape.load(Ordering::Relaxed)
     }
 
     /// Frames refused for containing a NaN or infinity.
@@ -284,6 +306,6 @@ impl IngestStats {
     /// Total refused frames across all causes.
     #[must_use]
     pub fn rejected_total(&self) -> u64 {
-        self.rejected_length() + self.rejected_dimension() + self.rejected_non_finite()
+        self.rejected_length() + self.rejected_shape() + self.rejected_non_finite()
     }
 }

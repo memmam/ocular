@@ -1,6 +1,6 @@
 use crate::pool::FrameLease;
 use crate::ring_buffer::IngestRingBuffer;
-use crate::{IngestStats, TokenElement};
+use crate::{FrameShape, IngestStats, TokenElement};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -122,26 +122,14 @@ pub struct IngestHandles<T: TokenElement> {
 impl<T: TokenElement> IngestHandles<T> {
     /// Builds the cache, the queue and the producer handle.
     ///
-    /// `max_queue` bounds the in-flight depth. Because publishing drops rather
-    /// than blocks, this sets how much jitter the loop absorbs before frames
-    /// start being discarded, not how far the sensor device can run ahead.
+    /// `shape` and `capacity` go straight to [`IngestRingBuffer::new`].
+    /// `max_queue` bounds the in-flight depth: because publishing drops
+    /// rather than blocks, this sets how much jitter the loop absorbs before
+    /// frames start being discarded, not how far the sensor device can run
+    /// ahead.
     #[must_use]
-    pub fn new(target_dim: usize, max_queue: usize) -> Self {
-        Self::with_capacity(
-            target_dim,
-            max_queue,
-            crate::IngestConfig::DEFAULT_FIFO_FRAMES,
-        )
-    }
-
-    /// Builds an ingest path retaining `capacity` frames.
-    ///
-    /// See [`IngestRingBuffer::with_capacity`] for how to choose it.
-    #[must_use]
-    pub fn with_capacity(target_dim: usize, max_queue: usize, capacity: usize) -> Self {
-        let buffer = Arc::new(RwLock::new(IngestRingBuffer::with_capacity(
-            target_dim, capacity,
-        )));
+    pub fn new(shape: FrameShape, capacity: usize, max_queue: usize) -> Self {
+        let buffer = Arc::new(RwLock::new(IngestRingBuffer::new(shape, capacity)));
         let stats = Arc::new(IngestStats::new());
         let control = Arc::new(IngestControl::new());
         let (tx, rx) = mpsc::channel(max_queue);
@@ -180,9 +168,9 @@ impl<T: TokenElement> AsyncIngestOrchestrator<T> {
     pub async fn start_orchestration_loop(mut self) {
         while let Some(frame) = self.frame_rx.recv().await {
             let capture = frame.capture;
-            let declared_dim = frame.declared_dim;
+            let declared = frame.declared_shape;
             let mut cache = self.buffer.write().await;
-            match cache.push_snapshot(&frame, capture, declared_dim) {
+            match cache.push_snapshot(&frame, capture, declared) {
                 Ok(evicted) => {
                     self.stats.record_accepted();
                     if evicted {

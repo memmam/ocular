@@ -5,7 +5,7 @@
 //! which returns the buffer to the pool. In steady state the same buffers
 //! circulate for the life of the process.
 
-use crate::{CaptureTimestamp, TokenElement};
+use crate::{CaptureTimestamp, FrameShape, TokenElement};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -63,7 +63,7 @@ impl<T: TokenElement> BufferPool<T> {
             buf: Some(buf),
             pool: Arc::clone(self),
             capture: CaptureTimestamp::default(),
-            declared_dim: 0,
+            declared_shape: FrameShape::new(0, 0),
         }
     }
 
@@ -115,15 +115,15 @@ pub struct FrameLease<T: TokenElement> {
     pool: Arc<BufferPool<T>>,
     /// Capture time reported by the sensor device.
     pub capture: CaptureTimestamp,
-    /// Target model width the sensor device projected this frame for.
-    pub declared_dim: usize,
+    /// Frame geometry the sensor device says this block has.
+    pub declared_shape: FrameShape,
 }
 
 impl<T: TokenElement> FrameLease<T> {
     /// Stamps the frame header carried alongside the token block.
-    pub fn set_header(&mut self, capture: CaptureTimestamp, declared_dim: usize) {
+    pub fn set_header(&mut self, capture: CaptureTimestamp, declared_shape: FrameShape) {
         self.capture = capture;
-        self.declared_dim = declared_dim;
+        self.declared_shape = declared_shape;
     }
 }
 
