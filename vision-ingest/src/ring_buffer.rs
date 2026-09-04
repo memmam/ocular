@@ -1,21 +1,12 @@
 use crate::{CaptureTimestamp, FrameMeta, IngestConfig, IngestError, StreamGuard, TokenElement};
 use std::time::{Duration, Instant};
 
-/// Maps a monotonic sequence number onto a slot index.
-///
-/// The remainder is strictly less than `MAX_FIFO_FRAMES` (30), so it always
-/// fits in a `usize` regardless of pointer width.
-#[allow(clippy::cast_possible_truncation)]
-const fn slot_of(sequence: u64) -> usize {
-    (sequence % IngestConfig::MAX_FIFO_FRAMES as u64) as usize
-}
-
 /// Selects which retained frames an export writes out.
 ///
 /// A resident agent shares its context window with other work, so inserting
-/// the whole window on every turn is rarely what you want: 30 frames is
-/// `30 * TOKENS_PER_FRAME` tokens, and consecutive frames at a few FPS are
-/// largely redundant.
+/// the whole window on every turn is rarely what you want: a full window is
+/// `capacity * TOKENS_PER_FRAME` tokens, and consecutive frames at a few FPS
+/// are largely redundant. `max_frames` is clamped to the cache's capacity.
 #[derive(Clone, Copy, Debug)]
 pub struct ExportPolicy {
     /// Write at most this many frames, counting back from the newest.
@@ -33,7 +24,7 @@ impl ExportPolicy {
     #[must_use]
     pub const fn all() -> Self {
         Self {
-            max_frames: IngestConfig::MAX_FIFO_FRAMES,
+            max_frames: usize::MAX,
             max_age: None,
             stride: 1,
         }
@@ -66,7 +57,7 @@ impl Default for ExportPolicy {
 /// Fixed-capacity cyclic cache of the most recent frames.
 ///
 /// Token storage is one flat, contiguous block sized at construction to
-/// `MAX_FIFO_FRAMES * TOKENS_PER_FRAME * target_dim`. Pushing copies into a
+/// `capacity * TOKENS_PER_FRAME * target_dim`. Pushing copies into a
 /// slot; nothing is allocated, moved or freed on the hot path, and the
 /// resident footprint is constant for the life of the cache.
 pub struct IngestRingBuffer<T: TokenElement> {
@@ -75,30 +66,49 @@ pub struct IngestRingBuffer<T: TokenElement> {
     head: u64,
     target_dim: usize,
     frame_len: usize,
+    capacity: usize,
 }
 
 impl<T: TokenElement> IngestRingBuffer<T> {
-    /// Allocates the full token block and slot metadata up front.
+    /// Allocates a cache holding [`IngestConfig::DEFAULT_FIFO_FRAMES`] frames.
     ///
     /// # Panics
     ///
-    /// Panics if `target_dim` is zero, or if the resulting window size
-    /// overflows `usize`.
+    /// Panics if `target_dim` is zero, or if the window size overflows `usize`.
     #[must_use]
     pub fn new(target_dim: usize) -> Self {
+        Self::with_capacity(target_dim, IngestConfig::DEFAULT_FIFO_FRAMES)
+    }
+
+    /// Allocates a cache holding `capacity` frames.
+    ///
+    /// `capacity` is the retention window, and on a system with durable storage
+    /// downstream it is really a decision deadline: how long the agent has to
+    /// notice something and commit it somewhere permanent before it rolls off.
+    /// At `f` frames per second the window lasts `capacity / f` seconds and
+    /// costs `capacity * TOKENS_PER_FRAME * target_dim` elements resident.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `target_dim` or `capacity` is zero, or if the window size
+    /// overflows `usize`.
+    #[must_use]
+    pub fn with_capacity(target_dim: usize, capacity: usize) -> Self {
         assert!(target_dim > 0, "target_dim must be non-zero");
+        assert!(capacity > 0, "capacity must be non-zero");
         let frame_len = IngestConfig::TOKENS_PER_FRAME
             .checked_mul(target_dim)
             .expect("frame length overflows usize");
         let total = frame_len
-            .checked_mul(IngestConfig::MAX_FIFO_FRAMES)
+            .checked_mul(capacity)
             .expect("window size overflows usize");
         Self {
             tokens: vec![T::default(); total],
-            meta: vec![None; IngestConfig::MAX_FIFO_FRAMES],
+            meta: vec![None; capacity],
             head: 0,
             target_dim,
             frame_len,
+            capacity,
         }
     }
 
@@ -119,7 +129,7 @@ impl<T: TokenElement> IngestRingBuffer<T> {
     ) -> Result<bool, IngestError> {
         StreamGuard::verify(tokens, self.frame_len, declared_dim, self.target_dim)?;
 
-        let slot = slot_of(self.head);
+        let slot = self.slot_of(self.head);
         let start = slot * self.frame_len;
         self.tokens[start..start + self.frame_len].copy_from_slice(tokens);
 
@@ -150,23 +160,32 @@ impl<T: TokenElement> IngestRingBuffer<T> {
     /// retained frame is older than `policy.max_age`.
     pub fn export_with(&self, out: &mut Vec<T>, policy: &ExportPolicy) -> usize {
         out.clear();
-        let max_frames = policy.max_frames.min(IngestConfig::MAX_FIFO_FRAMES);
-        let stride = policy.stride.max(1);
+        if self.head == 0 {
+            return 0;
+        }
+        let stride = policy.stride.max(1) as u64;
+        let max_frames = policy.max_frames.min(self.capacity);
         let now = Instant::now();
-
-        // Slot indices, newest first. Bounded by the window, so it stays on the
-        // stack and the export path allocates nothing.
-        let mut chosen = [0usize; IngestConfig::MAX_FIFO_FRAMES];
-        let mut count = 0;
-        let mut live_seen = 0usize;
         let oldest = self.oldest_sequence();
-        let mut sequence = self.head;
+        let newest = self.head - 1;
 
-        while sequence > oldest && count < max_frames {
-            sequence -= 1;
-            let slot = slot_of(sequence);
-            let Some(meta) = self.meta[slot] else {
-                continue;
+        // Live frames occupy a contiguous run of sequences ending at `newest`
+        // (`clear` empties the whole window), so the selection can be counted
+        // walking back and then replayed forward. Nothing is stored per frame,
+        // which keeps this allocation-free at any capacity.
+        let mut count: u64 = 0;
+        while usize::try_from(count).unwrap_or(usize::MAX) < max_frames {
+            let Some(sequence) = count
+                .checked_mul(stride)
+                .and_then(|offset| newest.checked_sub(offset))
+            else {
+                break;
+            };
+            if sequence < oldest {
+                break;
+            }
+            let Some(meta) = self.meta[self.slot_of(sequence)] else {
+                break;
             };
             if let Some(max_age) = policy.max_age {
                 // Arrival is monotonic in sequence order, so everything past
@@ -175,19 +194,17 @@ impl<T: TokenElement> IngestRingBuffer<T> {
                     break;
                 }
             }
-            if live_seen % stride == 0 {
-                chosen[count] = slot;
-                count += 1;
-            }
-            live_seen += 1;
+            count += 1;
         }
 
-        out.reserve(count * self.frame_len);
-        for &slot in chosen[..count].iter().rev() {
-            let start = slot * self.frame_len;
+        let written = usize::try_from(count).unwrap_or(usize::MAX);
+        out.reserve(written * self.frame_len);
+        for step in (0..count).rev() {
+            let sequence = newest - step * stride;
+            let start = self.slot_of(sequence) * self.frame_len;
             out.extend_from_slice(&self.tokens[start..start + self.frame_len]);
         }
-        count
+        written
     }
 
     /// Writes every frame `accept` returns `true` for, oldest first, into `out`.
@@ -201,7 +218,7 @@ impl<T: TokenElement> IngestRingBuffer<T> {
         out.clear();
         let mut count = 0;
         for sequence in self.oldest_sequence()..self.head {
-            let slot = slot_of(sequence);
+            let slot = self.slot_of(sequence);
             let Some(meta) = self.meta[slot] else {
                 continue;
             };
@@ -262,7 +279,7 @@ impl<T: TokenElement> IngestRingBuffer<T> {
         let now = Instant::now();
         (self.oldest_sequence()..self.head)
             .rev()
-            .find_map(|sequence| self.meta[slot_of(sequence)])
+            .find_map(|sequence| self.meta[self.slot_of(sequence)])
             .map(|meta| now.saturating_duration_since(meta.arrival))
     }
 
@@ -280,14 +297,20 @@ impl<T: TokenElement> IngestRingBuffer<T> {
     /// Metadata for the retained frames, oldest first.
     pub fn frame_metadata(&self) -> impl Iterator<Item = FrameMeta> + '_ {
         (self.oldest_sequence()..self.head).filter_map(move |sequence| {
-            let slot = slot_of(sequence);
+            let slot = self.slot_of(sequence);
             self.meta[slot]
         })
     }
 
     fn oldest_sequence(&self) -> u64 {
-        self.head
-            .saturating_sub(IngestConfig::MAX_FIFO_FRAMES as u64)
+        self.head.saturating_sub(self.capacity as u64)
+    }
+
+    /// Maps a monotonic sequence number onto a slot index. The remainder is
+    /// strictly less than `capacity`, which is a `usize`, so this never truncates.
+    #[allow(clippy::cast_possible_truncation)]
+    fn slot_of(&self, sequence: u64) -> usize {
+        (sequence % self.capacity as u64) as usize
     }
 
     /// Frames currently retained.
@@ -295,7 +318,7 @@ impl<T: TokenElement> IngestRingBuffer<T> {
     pub fn len(&self) -> usize {
         usize::try_from(self.head)
             .unwrap_or(usize::MAX)
-            .min(IngestConfig::MAX_FIFO_FRAMES)
+            .min(self.capacity)
     }
 
     /// True while no frame has been accepted.
@@ -313,7 +336,13 @@ impl<T: TokenElement> IngestRingBuffer<T> {
     /// Elements in a full window. Use this to size an [`Self::export_into`] buffer.
     #[must_use]
     pub fn window_capacity(&self) -> usize {
-        self.frame_len * IngestConfig::MAX_FIFO_FRAMES
+        self.frame_len * self.capacity
+    }
+
+    /// Frames this cache retains before overwriting.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 
     /// Target model width this cache validates against.

@@ -118,7 +118,7 @@ async fn queue_full_drops_rather_than_blocking() {
 fn window_evicts_oldest_and_stays_capped() {
     let mut cache = IngestRingBuffer::<f32>::new(TEST_DIM);
     let overshoot = 5u64;
-    let total = IngestConfig::MAX_FIFO_FRAMES as u64 + overshoot;
+    let total = IngestConfig::DEFAULT_FIFO_FRAMES as u64 + overshoot;
 
     for i in 0..total {
         let marker = i as f32;
@@ -126,12 +126,12 @@ fn window_evicts_oldest_and_stays_capped() {
         let evicted = cache
             .push_snapshot(&block, CaptureTimestamp::from_nanos(i), TEST_DIM)
             .expect("well-formed frame");
-        assert_eq!(evicted, i >= IngestConfig::MAX_FIFO_FRAMES as u64);
+        assert_eq!(evicted, i >= IngestConfig::DEFAULT_FIFO_FRAMES as u64);
     }
 
     let payload = cache.export_linearized_payload();
     assert_eq!(payload.len(), cache.window_capacity());
-    assert_eq!(cache.len(), IngestConfig::MAX_FIFO_FRAMES);
+    assert_eq!(cache.len(), IngestConfig::DEFAULT_FIFO_FRAMES);
     assert!((payload[0] - overshoot as f32).abs() < f32::EPSILON);
     assert!((payload[payload.len() - 1] - (total - 1) as f32).abs() < f32::EPSILON);
 
@@ -143,7 +143,7 @@ fn window_evicts_oldest_and_stays_capped() {
 #[test]
 fn export_into_reuses_the_caller_buffer() {
     let mut cache = IngestRingBuffer::<f32>::new(TEST_DIM);
-    for i in 0..IngestConfig::MAX_FIFO_FRAMES {
+    for i in 0..IngestConfig::DEFAULT_FIFO_FRAMES {
         let block = vec![i as f32; FRAME_LEN];
         cache
             .push_snapshot(&block, CaptureTimestamp::from_nanos(i as u64), TEST_DIM)
@@ -209,7 +209,7 @@ async fn cache_is_readable_while_ingest_runs() {
 
     let reader: Arc<RwLock<IngestRingBuffer<f32>>> = Arc::clone(&handles.buffer);
     let reader_task = tokio::spawn(async move {
-        let mut out = Vec::with_capacity(FRAME_LEN * IngestConfig::MAX_FIFO_FRAMES);
+        let mut out = Vec::with_capacity(FRAME_LEN * IngestConfig::DEFAULT_FIFO_FRAMES);
         for _ in 0..20 {
             reader.read().await.export_into(&mut out);
             assert_eq!(out.len() % FRAME_LEN, 0);
@@ -423,4 +423,71 @@ fn export_matching_accepts_an_arbitrary_predicate() {
     assert_eq!(written, 4);
     assert!((out[0] - 0.0).abs() < f32::EPSILON);
     assert!((out[FRAME_LEN] - 2.0).abs() < f32::EPSILON);
+}
+
+// --- window capacity is a deployment parameter, not a baked-in constant ---
+
+#[test]
+fn capacity_is_configurable_and_bounds_the_window() {
+    let mut cache = IngestRingBuffer::<f32>::with_capacity(TEST_DIM, 4);
+    assert_eq!(cache.capacity(), 4);
+    assert_eq!(cache.window_capacity(), 4 * FRAME_LEN);
+
+    for i in 0..10u64 {
+        let block = vec![i as f32; FRAME_LEN];
+        cache
+            .push_snapshot(&block, CaptureTimestamp::from_nanos(i), TEST_DIM)
+            .expect("well-formed frame");
+    }
+    assert_eq!(cache.len(), 4);
+
+    let payload = cache.export_linearized_payload();
+    assert_eq!(payload.len(), 4 * FRAME_LEN);
+    // Newest four: 6, 7, 8, 9.
+    assert!((payload[0] - 6.0).abs() < f32::EPSILON);
+    assert!((payload[3 * FRAME_LEN] - 9.0).abs() < f32::EPSILON);
+}
+
+#[test]
+fn export_is_allocation_free_at_a_large_capacity() {
+    // A capacity well past the default, to show the export path holds nothing
+    // per frame and so does not fall back to allocating as the window grows.
+    let mut cache = IngestRingBuffer::<f32>::with_capacity(4, 512);
+    let frame_len = cache.frame_len();
+    for i in 0..600u64 {
+        let block = vec![i as f32; frame_len];
+        cache
+            .push_snapshot(&block, CaptureTimestamp::from_nanos(i), 4)
+            .expect("well-formed frame");
+    }
+
+    let mut out = Vec::with_capacity(cache.window_capacity());
+    let capacity_before = out.capacity();
+    for _ in 0..8 {
+        assert_eq!(cache.export_with(&mut out, &ExportPolicy::all()), 512);
+        assert_eq!(
+            cache.export_with(&mut out, &ExportPolicy::all().with_stride(7)),
+            74
+        );
+    }
+    assert_eq!(out.capacity(), capacity_before);
+}
+
+#[tokio::test]
+async fn orchestrator_honours_a_custom_capacity() {
+    let handles = IngestHandles::<f32>::with_capacity(TEST_DIM, 8, 2);
+    let pool = BufferPool::<f32>::with_buffers(FRAME_LEN, 8);
+    tokio::spawn(handles.orchestrator.start_orchestration_loop());
+
+    for i in 0..5u64 {
+        while !publish(&pool, &handles.sender, i as f32, i, TEST_DIM) {
+            tokio::task::yield_now().await;
+        }
+    }
+    await_frames(&handles.stats, 5, 0).await;
+
+    let cache = handles.buffer.read().await;
+    assert_eq!(cache.capacity(), 2);
+    assert_eq!(cache.len(), 2);
+    assert_eq!(cache.export_linearized_payload().len(), 2 * FRAME_LEN);
 }

@@ -53,8 +53,11 @@ impl IngestConfig {
     /// Tokens emitted per frame by the resampler. A sequence length, not a
     /// vector width: one frame carries `TOKENS_PER_FRAME * target_dim` elements.
     pub const TOKENS_PER_FRAME: usize = 64;
-    /// Depth of the timeline cache (10s at 3 FPS).
-    pub const MAX_FIFO_FRAMES: usize = 30;
+    /// Default depth of the timeline cache (10s at 3 FPS). A starting point,
+    /// not a limit: size the window with
+    /// [`ring_buffer::IngestRingBuffer::with_capacity`] to whatever the
+    /// deployment's capture rate and decide-and-commit latency call for.
+    pub const DEFAULT_FIFO_FRAMES: usize = 30;
 }
 
 /// Element type of a token block.

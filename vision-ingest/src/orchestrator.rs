@@ -127,7 +127,21 @@ impl<T: TokenElement> IngestHandles<T> {
     /// start being discarded, not how far the sensor device can run ahead.
     #[must_use]
     pub fn new(target_dim: usize, max_queue: usize) -> Self {
-        let buffer = Arc::new(RwLock::new(IngestRingBuffer::new(target_dim)));
+        Self::with_capacity(
+            target_dim,
+            max_queue,
+            crate::IngestConfig::DEFAULT_FIFO_FRAMES,
+        )
+    }
+
+    /// Builds an ingest path retaining `capacity` frames.
+    ///
+    /// See [`IngestRingBuffer::with_capacity`] for how to choose it.
+    #[must_use]
+    pub fn with_capacity(target_dim: usize, max_queue: usize, capacity: usize) -> Self {
+        let buffer = Arc::new(RwLock::new(IngestRingBuffer::with_capacity(
+            target_dim, capacity,
+        )));
         let stats = Arc::new(IngestStats::new());
         let control = Arc::new(IngestControl::new());
         let (tx, rx) = mpsc::channel(max_queue);

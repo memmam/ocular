@@ -80,6 +80,15 @@ bandwidth win; the copy itself is small against a unified memory bus.
 width with no conversion: `f16` halves both the resident window (to ~7.9 MB)
 and the wire rate (to ~768 KB/s at 3 FPS).
 
+**The retention window is a deployment parameter.** `with_capacity` sets how
+many frames the cache holds; `IngestConfig::DEFAULT_FIFO_FRAMES` (30, ten
+seconds at 3 FPS) is a starting point, not a limit. With durable storage
+downstream the window is really a decision deadline -- how long the agent has
+to notice something and commit it somewhere permanent before it rolls off --
+so it belongs to the deployment, not to this crate. Selection during export is
+computed arithmetically rather than held per frame, so a large window costs
+memory but no extra allocation.
+
 **The compute node is a resident agent, not a dedicated vision pipeline.** It
 needs eyes for some of its work and not the rest, which constrains three things:
 
